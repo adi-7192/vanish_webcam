@@ -27,14 +27,22 @@ VanishCam reads your real webcam, adds the effect, and sends the result to the *
 
 The panel floats above your call and never takes focus away from it. Close it any time and reopen it from the menu-bar icon, which has the same controls.
 
-### Gestures
+### Effects and gestures
 
-| | Vanish | Reappear |
+Pick an effect in the panel's **Effect** menu (or under **Effect** in the menu-bar icon).
+
+| Effect | Vanish | Reappear |
 |---|---|---|
-| **Normal** | ✌️ V sign: you dissolve away with a glowing edge (2.4 s) | ✋ open palm: you dissolve back in (1.6 s) |
-| **Naruto** | 🙏 palms together, fingers side by side: you vanish in a puff of smoke | ✋ open palm: you reappear inside a puff of smoke |
+| **Dissolve** | ✌️ V sign: you dissolve away with a glowing edge | ✋ open palm: you dissolve back in |
+| **Dust** | ✌️ V sign: you crumble into particles that blow away | ✋ open palm: the dust flies back together |
+| **Teleport** | ✌️ V sign: a shimmering column of light beams you out | ✋ open palm: you beam back in |
+| **Glitch** | ✌️ V sign: you break into slices and split colours, then flicker out | ✋ open palm: you glitch back in |
+| **Portal** | ✌️ V sign: a glowing ring opens and you spiral into it | ✋ open palm: you spiral back out |
+| **Smoke puff** | 🙏 palms together, fingers side by side: you vanish in a puff of smoke | ✋ open palm: you reappear inside the smoke |
 
-Hold a gesture for about a third of a second. A quick, accidental hand shape does not trigger anything, and there is a short pause after each switch. In Naruto mode, a "poof" sound plays on your speakers each time.
+Each effect has its own sound, played forwards when you vanish and backwards when you come back. The sounds are generated in code (`packaging/make_sounds.py`); the smoke puff uses the original `assets/vanish.MP3`.
+
+Hold a gesture for about a third of a second. A quick, accidental hand shape does not trigger anything, and there is a short pause after each switch. Sounds play on your speakers.
 
 While you are invisible, the rest of the room stays live: only the area where you are is filled in with the background, which keeps updating as the light changes.
 

@@ -256,6 +256,28 @@ class GestureWorkerTests(unittest.TestCase):
         self.assertFalse(worker.thread.is_alive())
 
 
+class EffectModesTests(unittest.TestCase):
+    def test_every_mode_has_both_sounds(self):
+        from vanish_sound import sound_paths
+        for mode in vanish_cam.MODES:
+            for path in sound_paths(mode).values():
+                self.assertTrue(path.is_file(), path)
+
+    def test_only_naruto_uses_palms_together(self):
+        self.assertIn("palms", vanish_cam.vanish_pose("naruto"))
+        for mode in ("normal", "dust", "beam", "glitch", "portal"):
+            self.assertIn("V sign", vanish_cam.vanish_pose(mode))
+
+    def test_new_modes_use_the_v_sign_check(self):
+        recognizer = SimpleNamespace()
+        worker = vanish_cam.GestureWorker(recognizer, "portal")
+        try:
+            with patch.object(vanish_cam, "recognize_gesture", return_value=("Victory", 0.9)):
+                self.assertEqual(worker.check("visible", None, 10), (True, "Victory score=0.90"))
+        finally:
+            worker.close()
+
+
 class HandModelImageTests(unittest.TestCase):
     def setUp(self):
         data = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)

@@ -125,7 +125,7 @@ class VideoLoopTests(unittest.TestCase):
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(segmenter, recognizer)))
             mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=camera))
-            mocks.enter_context(patch.object(app, "VanishSound", return_value=Mock()))
+            mocks.enter_context(patch.object(app, "EffectSound", return_value=Mock()))
             mocks.enter_context(patch.object(app, "person_mask", return_value=mask))
             mocks.enter_context(patch.object(app, "recognize_gesture", side_effect=victory))
             mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=lambda: clock[0]))

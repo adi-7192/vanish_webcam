@@ -75,7 +75,7 @@ class VanishEffectTests(unittest.TestCase):
         effect = VanishEffect(style)
         self.assertIs(effect.render(frame, background, mask, 0.0), frame)
         self.assertFalse(effect.appear(0.0, mask))  # nothing to reappear from
-        self.assertTrue(effect.vanish(1.0, mask))
+        self.assertTrue(effect.vanish(1.0, mask, frame))
         self.assertFalse(effect.vanish(1.1, mask))
         middle = effect.render(frame, background, mask, 1.0 + vanish_time / 2)
         self.assertTrue(np.any(middle != frame))
@@ -83,7 +83,7 @@ class VanishEffectTests(unittest.TestCase):
         self.assertEqual(effect.phase, "vanished")
         np.testing.assert_array_equal(gone[20:45, 33:47], background[20:45, 33:47])
         np.testing.assert_array_equal(gone[:, :10], frame[:, :10])  # room still live
-        self.assertTrue(effect.appear(10.0, mask))
+        self.assertTrue(effect.appear(10.0, mask, frame))
         effect.render(frame, background, mask, 10.0 + appear_time / 2)
         self.assertEqual(effect.phase, "appearing")
         back = effect.render(frame, background, mask, 10.0 + appear_time + 0.01)
@@ -95,6 +95,30 @@ class VanishEffectTests(unittest.TestCase):
 
     def test_naruto_smoke_out_and_back_in_without_log(self):
         self.run_cycle("naruto", effects.SMOKE_SECONDS, effects.SMOKE_SECONDS)
+
+    def test_every_new_style_goes_out_and_back_in(self):
+        for name in ("dust", "beam", "glitch", "portal"):
+            with self.subTest(style=name):
+                style = effects.STYLES[name]
+                self.run_cycle(name, style.vanish_seconds, style.appear_seconds)
+
+    def test_styles_keep_the_room_live_mid_effect(self):
+        frame, background, mask = scene()
+        frame[:, :4] = 17  # a strip of room outside every effect's reach
+        for name in effects.STYLES:
+            with self.subTest(style=name):
+                effect = VanishEffect(name)
+                effect.vanish(0.0, mask, frame)
+                middle = effect.render(frame, background, mask, effect.style.vanish_seconds * 0.5)
+                np.testing.assert_array_equal(middle[:, :4], frame[:, :4])
+
+    def test_dust_particles_fly_away_from_the_person(self):
+        frame, background, mask = scene()
+        style = effects.DustStyle()
+        style.begin(frame, mask, appearing=False)
+        out = style.render(frame, background, mask, 0.5, appearing=False)
+        right_of_person = out[:, 52:]
+        self.assertTrue((right_of_person != frame[:, 52:]).any())  # particles drifted right
 
     def test_naruto_person_is_hidden_inside_the_first_smoke(self):
         frame, background, mask = scene()

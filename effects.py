@@ -294,33 +294,331 @@ def render_smoke(frame: np.ndarray, background: np.ndarray, cover: np.ndarray,
     return output
 
 
+# ---- Styles -----------------------------------------------------------------
+#
+# Every style renders "how gone" the person is as p in 0..1 (0 visible, 1 gone).
+# Reappearing plays the same style with p running back from 1 to 0.
+
+def _ramp(edge0: float, edge1: float, value: float) -> float:
+    return float(smoothstep(edge0, edge1, np.float32(value)))
+
+
+def person_bounds(cover: np.ndarray, threshold: float = 0.3):
+    """(x0, x1, y0, y1) of the person, or a centred default."""
+    ys, xs = np.nonzero(cover > threshold)
+    height, width = cover.shape
+    if not len(xs):
+        return width // 3, 2 * width // 3, height // 4, height
+    return int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+
+
+def draw_points(image: np.ndarray, points: np.ndarray, colors: np.ndarray,
+                alpha: np.ndarray, size: int = 2) -> None:
+    """Alpha-blend small squares at ``points`` (N x 2, x/y) into ``image``."""
+    height, width = image.shape[:2]
+    xs, ys = points[:, 0].astype(np.int32), points[:, 1].astype(np.int32)
+    colors = np.broadcast_to(np.asarray(colors, np.float32), (len(xs), 3))
+    alpha = np.broadcast_to(np.asarray(alpha, np.float32), (len(xs),))
+    for dx in range(size):
+        for dy in range(size):
+            x, y = xs + dx, ys + dy
+            inside = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+            a = alpha[inside][:, None]
+            pixels = image[y[inside], x[inside]].astype(np.float32)
+            image[y[inside], x[inside]] = (pixels * (1 - a) + colors[inside] * a).astype(np.uint8)
+
+
+class Style:
+    vanish_seconds = 2.0
+    appear_seconds = 1.6
+
+    def begin(self, frame: np.ndarray | None, cover: np.ndarray, appearing: bool) -> None:
+        """Called when a vanish or reappear starts; ``frame`` is the live webcam."""
+
+    def render(self, frame, background, cover, p: float, appearing: bool) -> np.ndarray:
+        raise NotImplementedError
+
+
+class DissolveStyle(Style):
+    """Normal: the person dissolves bottom-up with a glowing cyan edge."""
+
+    vanish_seconds, appear_seconds = DISSOLVE_SECONDS, REFORM_SECONDS
+
+    def __init__(self):
+        self.fields: tuple[np.ndarray, np.ndarray] | None = None
+
+    def render(self, frame, background, cover, p, appearing):
+        height, width = frame.shape[:2]
+        if self.fields is None or self.fields[0].shape != (height, width):
+            self.fields = make_dissolve_fields(height, width)
+        return render_dissolve(frame, background, cover, p, *self.fields)
+
+
+class SmokeStyle(Style):
+    """Naruto: a puff of smoke; the person swaps while the smoke is densest."""
+
+    vanish_seconds = appear_seconds = SMOKE_SECONDS
+
+    def __init__(self):
+        self.anchor = (0, 0, 1)
+
+    def begin(self, frame, cover, appearing):
+        self.anchor = smoke_anchor(cover)
+
+    def render(self, frame, background, cover, p, appearing):
+        if appearing:
+            age = (1.0 - p) * SMOKE_SECONDS
+            hidden = 1.0 - min(1.0, max(0.0, age - 0.10) / SMOKE_SWAP_SECONDS)
+        else:
+            age = p * SMOKE_SECONDS
+            hidden = min(1.0, age / SMOKE_SWAP_SECONDS)
+        return render_smoke(frame, background, cover, hidden, self.anchor, age)
+
+
+class DustStyle(Style):
+    """The person crumbles into particles that blow away on the wind."""
+
+    vanish_seconds, appear_seconds = 2.6, 2.0
+    LIFE = 0.9           # seconds a particle stays visible after release
+    RELEASE_SPAN = 0.6   # releases happen over the first 60% of the effect
+    COUNT = 6000
+
+    def __init__(self):
+        self.release_map: np.ndarray | None = None
+
+    def begin(self, frame, cover, appearing):
+        height, width = cover.shape
+        rng = np.random.default_rng(4242)
+        ys, xs = np.nonzero(cover > 0.5)
+        self.seconds = self.appear_seconds if appearing else self.vanish_seconds
+        if not len(xs):
+            self.release_map = None
+            return
+        x0, x1 = xs.min(), xs.max()
+        across = np.clip((np.arange(width, dtype=np.float32) - x0) / max(1, x1 - x0), 0, 1)
+        noise = rng.random((max(2, height // 24), max(2, width // 24)), dtype=np.float32)
+        noise = cv2.resize(noise, (width, height), interpolation=cv2.INTER_CUBIC)
+        # The wind blows left to right, so the left side crumbles first.
+        self.release_map = (across[None, :] * 0.65 + np.clip(noise, 0, 1) * 0.35) * self.RELEASE_SPAN
+        pick = rng.choice(len(xs), size=min(self.COUNT, len(xs)), replace=False)
+        px, py = xs[pick], ys[pick]
+        source = frame if frame is not None else np.full((height, width, 3), 200, np.uint8)
+        self.colors = source[py, px].astype(np.float32)
+        self.release = self.release_map[py, px]
+        self.origin = np.stack([px, py], axis=1).astype(np.float32)
+        self.velocity = np.stack([rng.uniform(140, 360, len(px)),
+                                  rng.uniform(-160, -30, len(px))], axis=1).astype(np.float32)
+        self.flutter = rng.uniform(0, 2 * np.pi, len(px)).astype(np.float32)
+
+    def render(self, frame, background, cover, p, appearing):
+        if self.release_map is None or self.release_map.shape != cover.shape:
+            return replace_person(frame, background, cover * p)
+        survive = smoothstep(p - 0.04, p + 0.04, self.release_map)
+        output = replace_person(frame, background, cover * (1.0 - survive))
+        age = (p - self.release) * self.seconds
+        live = (age > 0) & (age < self.LIFE)
+        if not live.any():
+            return output
+        if output is frame:
+            output = frame.copy()
+        a = age[live]
+        points = self.origin[live] + self.velocity[live] * a[:, None]
+        points[:, 1] += np.sin(a * 7 + self.flutter[live]) * 6
+        alpha = (1 - a / self.LIFE) ** 1.5 * 0.9
+        draw_points(output, points, self.colors[live], alpha, size=2)
+        return output
+
+
+class BeamStyle(Style):
+    """Teleport: a shimmering column of light beams the person out."""
+
+    vanish_seconds, appear_seconds = 1.8, 1.5
+    COLOR = np.array((255, 235, 190), np.float32)  # icy blue-white (BGR)
+
+    def __init__(self):
+        self.bounds = (0, 1, 0, 1)
+        self.sparks = np.zeros((0, 2), np.float32)
+
+    def begin(self, frame, cover, appearing):
+        self.bounds = person_bounds(cover)
+        ys, xs = np.nonzero(cover > 0.5)
+        if len(xs) > 20000:
+            keep = np.random.default_rng(5).choice(len(xs), 20000, replace=False)
+            xs, ys = xs[keep], ys[keep]
+        self.sparks = np.stack([xs, ys], axis=1).astype(np.float32)
+
+    def render(self, frame, background, cover, p, appearing):
+        output = replace_person(frame, background, cover * _ramp(0.3, 0.7, p))
+        if output is frame:
+            output = frame.copy()
+        beam = _ramp(0.0, 0.22, p) * (1.0 - _ramp(0.78, 1.0, p))
+        if beam <= 0.01:
+            return output
+        height, width = output.shape[:2]
+        x0, x1, y0, _ = self.bounds
+        center = (x0 + x1) / 2
+        half = max(8.0, (x1 - x0) / 2 * (0.55 + 0.45 * (1 - _ramp(0.7, 1.0, p))))
+        left, right = int(max(0, center - half * 1.6)), int(min(width, center + half * 1.6))
+        if left >= right:
+            return output
+        columns = np.arange(left, right, dtype=np.float32)
+        across = np.exp(-((columns - center) / half) ** 2 * 2.2)
+        rows = np.arange(height, dtype=np.float32)
+        above = np.clip(1 - np.maximum(0, y0 - rows) / max(1, y0 + 1) * 0.6, 0.3, 1.0)
+        scan = 0.85 + 0.15 * np.sin(rows * 0.35 - p * 60)
+        glow = (above * scan)[:, None] * across[None, :] * beam * 0.55
+        region = output[:, left:right].astype(np.float32)
+        output[:, left:right] = np.clip(region + glow[:, :, None] * self.COLOR, 0, 255).astype(np.uint8)
+        density = beam * max(0.0, 1 - abs(p - 0.5) * 1.4)
+        count = min(len(self.sparks), int(500 * density))
+        if count:
+            rng = np.random.default_rng(int(p * 997))
+            pick = rng.choice(len(self.sparks), count, replace=False)
+            draw_points(output, self.sparks[pick], (255, 250, 240), rng.uniform(0.5, 1.0, count), size=2)
+        return output
+
+
+class GlitchStyle(Style):
+    """The person breaks into shifted slices and split colours, then flickers out."""
+
+    vanish_seconds, appear_seconds = 1.4, 1.2
+
+    def render(self, frame, background, cover, p, appearing):
+        area = person_box(cover, pad=24)
+        if area is None:
+            return frame
+        rng = np.random.default_rng(int(p * 1000) + 7)
+        strength = math.sin(math.pi * min(p, 1.0))
+        region, mask = frame[area], cover[area]
+        output = frame.copy()
+        output[area] = (region.astype(np.float32) * (1 - mask[..., None])
+                        + background[area].astype(np.float32) * mask[..., None]).astype(np.uint8)
+        layer, visible = region.copy(), mask.copy()
+        shift = int(round(strength * 10))
+        if shift:  # RGB split
+            layer[:, :, 0] = np.roll(layer[:, :, 0], -shift, axis=1)
+            layer[:, :, 2] = np.roll(layer[:, :, 2], shift, axis=1)
+        height, width = mask.shape
+        if strength > 0.35:
+            factor = int(2 + strength * 14)
+            small = cv2.resize(layer, (max(1, width // factor), max(1, height // factor)),
+                               interpolation=cv2.INTER_AREA)
+            blocky = cv2.resize(small, (width, height), interpolation=cv2.INTER_NEAREST)
+        else:
+            blocky = None
+        top = 0
+        while top < height:
+            rows = slice(top, min(height, top + int(rng.integers(4, 28))))
+            if rng.random() < p:  # this slice is gone
+                visible[rows] = 0
+            else:
+                if blocky is not None and rng.random() < strength * 0.5:
+                    layer[rows] = blocky[rows]
+                dx = int(rng.normal() * strength * 45)
+                if dx:
+                    layer[rows] = np.roll(layer[rows], dx, axis=1)
+                    visible[rows] = np.roll(visible[rows], dx, axis=1)
+            top = rows.stop
+        if rng.random() < p * 0.35:  # whole-person flicker
+            visible[:] = 0
+        a = visible[..., None]
+        output[area] = (output[area].astype(np.float32) * (1 - a) + layer.astype(np.float32) * a).astype(np.uint8)
+        return output
+
+
+class PortalStyle(Style):
+    """A glowing ring opens and the person spirals into it."""
+
+    vanish_seconds, appear_seconds = 1.9, 1.6
+    RING = np.array((60, 150, 255), np.float32)   # orange (BGR)
+    CORE = np.array((190, 235, 255), np.float32)  # hot inner edge
+
+    def __init__(self):
+        self.anchor = (0, 0, 1)
+
+    def begin(self, frame, cover, appearing):
+        self.anchor = smoke_anchor(cover)
+
+    def render(self, frame, background, cover, p, appearing):
+        cx, cy, size = self.anchor
+        height, width = frame.shape[:2]
+        output = replace_person(frame, background, cover)
+        if output is frame:
+            output = frame.copy()
+        opening = _ramp(0.0, 0.25, p) * (1 - _ramp(0.82, 1.0, p))
+        if opening > 0.01:  # ring first, so the person spirals in front of it
+            self.draw_ring(output, cx, cy, size * 0.55 * opening, p)
+        shrink = _ramp(0.15, 0.85, p)
+        if shrink < 0.99:
+            matrix = cv2.getRotationMatrix2D((float(cx), float(cy)), shrink * 300, 1 - shrink)
+            warped = cv2.warpAffine(frame, matrix, (width, height))
+            weight = cv2.warpAffine(cover, matrix, (width, height))[..., None]
+            output = (output.astype(np.float32) * (1 - weight) + warped.astype(np.float32) * weight).astype(np.uint8)
+        return output
+
+    def draw_ring(self, image, cx, cy, radius, p):
+        radius = max(3.0, radius)
+        reach = int(radius * 1.5) + 4
+        left, top = max(0, cx - reach), max(0, cy - reach)
+        right, bottom = min(image.shape[1], cx + reach), min(image.shape[0], cy + reach)
+        if left >= right or top >= bottom:
+            return
+        layer = np.zeros((bottom - top, right - left, 3), np.float32)
+        center = (cx - left, cy - top)
+        axes = (int(radius), int(radius * 0.92))
+        thickness = max(2, int(radius * 0.10))
+        cv2.ellipse(layer, center, axes, 0, 0, 360, self.RING.tolist(), thickness, cv2.LINE_AA)
+        layer = cv2.GaussianBlur(layer, (0, 0), sigmaX=max(1.0, radius * 0.06))
+        cv2.ellipse(layer, center, axes, 0, 0, 360, self.CORE.tolist(), max(1, thickness // 3), cv2.LINE_AA)
+        rng = np.random.default_rng(int(p * 600))
+        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False) + p * 14
+        jitter = rng.uniform(0.95, 1.18, len(angles))
+        for angle, scale in zip(angles, jitter):
+            x = int(center[0] + np.cos(angle) * axes[0] * scale)
+            y = int(center[1] + np.sin(angle) * axes[1] * scale)
+            cv2.circle(layer, (x, y), max(1, thickness // 3), self.CORE.tolist(), -1, cv2.LINE_AA)
+        region = image[top:bottom, left:right].astype(np.float32)
+        image[top:bottom, left:right] = np.clip(region + layer, 0, 255).astype(np.uint8)
+
+
+STYLES = {
+    "normal": DissolveStyle,
+    "naruto": SmokeStyle,
+    "dust": DustStyle,
+    "beam": BeamStyle,
+    "glitch": GlitchStyle,
+    "portal": PortalStyle,
+}
+
+
 # ---- State machine ----------------------------------------------------------
 
 class VanishEffect:
     """visible -> vanishing -> vanished -> appearing -> visible."""
 
     def __init__(self, style: str):
-        self.style = style
+        self.style_name = style
+        self.style = STYLES[style]()
         self.phase = "visible"
         self.started = 0.0
-        self.anchor: tuple[int, int, int] | None = None
-        self.fields: tuple[np.ndarray, np.ndarray] | None = None
 
-    def vanish(self, now: float, cover: np.ndarray) -> bool:
+    def vanish(self, now: float, cover: np.ndarray, frame: np.ndarray | None = None) -> bool:
         if self.phase != "visible":
             return False
-        self.phase, self.started, self.anchor = "vanishing", now, smoke_anchor(cover)
+        self.phase, self.started = "vanishing", now
+        self.style.begin(frame, cover, appearing=False)
         return True
 
-    def appear(self, now: float, cover: np.ndarray) -> bool:
+    def appear(self, now: float, cover: np.ndarray, frame: np.ndarray | None = None) -> bool:
         if self.phase not in ("vanishing", "vanished"):
             return False
         started = now
-        if self.phase == "vanishing" and self.style == "normal":
-            # Reverse from the current point of the dissolve instead of jumping.
-            progress = min(1.0, (now - self.started) / DISSOLVE_SECONDS)
-            started = now - (1.0 - progress) * REFORM_SECONDS
-        self.phase, self.started, self.anchor = "appearing", started, smoke_anchor(cover)
+        if self.phase == "vanishing":
+            # Reverse from the current point instead of jumping to "gone".
+            progress = min(1.0, (now - self.started) / self.style.vanish_seconds)
+            started = now - (1.0 - progress) * self.style.appear_seconds
+        self.phase, self.started = "appearing", started
+        self.style.begin(frame, cover, appearing=True)
         return True
 
     def reset(self) -> None:
@@ -331,38 +629,16 @@ class VanishEffect:
         if self.phase == "visible":
             return frame
         age = max(0.0, now - self.started)
-        if self.style == "naruto":
-            return self._render_smoke(frame, background, cover, age)
-        return self._render_dissolve(frame, background, cover, age)
-
-    def _render_dissolve(self, frame, background, cover, age):
-        height, width = frame.shape[:2]
-        if self.fields is None or self.fields[0].shape != (height, width):
-            self.fields = make_dissolve_fields(height, width)
         if self.phase == "vanishing":
-            progress = age / DISSOLVE_SECONDS
-            if progress >= 1.0:
+            p = age / self.style.vanish_seconds
+            if p >= 1.0:
                 self.phase = "vanished"
         elif self.phase == "appearing":
-            progress = 1.0 - age / REFORM_SECONDS
-            if progress <= 0.0:
+            p = 1.0 - age / self.style.appear_seconds
+            if p <= 0.0:
                 self.phase = "visible"
                 return frame
-        else:
-            progress = 1.0
-        return render_dissolve(frame, background, cover, float(np.clip(progress, 0.0, 1.0)), *self.fields)
-
-    def _render_smoke(self, frame, background, cover, age):
         if self.phase == "vanished":
             return replace_person(frame, background, cover)
-        if self.phase == "vanishing":
-            hidden = min(1.0, age / SMOKE_SWAP_SECONDS)
-            if age >= SMOKE_SECONDS:
-                self.phase = "vanished"
-                return replace_person(frame, background, cover)
-        else:  # appearing: the person returns once the smoke is dense
-            hidden = 1.0 - min(1.0, max(0.0, age - 0.10) / SMOKE_SWAP_SECONDS)
-            if age >= SMOKE_SECONDS:
-                self.phase = "visible"
-                return frame
-        return render_smoke(frame, background, cover, hidden, self.anchor, age)
+        appearing = self.phase == "appearing"
+        return self.style.render(frame, background, cover, float(np.clip(p, 0.0, 1.0)), appearing)

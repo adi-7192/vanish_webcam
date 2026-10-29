@@ -22,10 +22,10 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from effects import (
-    GestureHold, LiveBackground, VanishEffect, cover_mask,
+    STYLES, GestureHold, LiveBackground, VanishEffect, cover_mask,
     joined_hands_from_landmarks, open_palm_from_landmarks,
 )
-from vanish_sound import SOUND_PATH, VanishSound
+from vanish_sound import EffectSound, sound_paths
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -75,7 +75,12 @@ BACKGROUND_SAMPLE_SECONDS = 0.55
 GESTURE_INTERVAL_SECONDS = 0.14
 NARUTO_GESTURE_INTERVAL_SECONDS = 0.08
 VICTORY_MIN_SCORE = 0.62
-VANISH_POSE = {"normal": "a V sign ✌️", "naruto": "palms together 🙏"}
+MODES = tuple(STYLES)  # normal, naruto, dust, beam, glitch, portal
+
+
+def vanish_pose(mode: str) -> str:
+    """Naruto uses palms together; every other effect uses the V sign."""
+    return "palms together 🙏" if mode == "naruto" else "a V sign ✌️"
 
 
 def positive_fps(value: str) -> float:
@@ -104,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         help="Require the virtual camera; by default it is used when available. --no-virtual-camera disables it",
     )
     parser.add_argument(
-        "--mode", choices=("normal", "naruto"),
+        "--mode", choices=MODES,
         help="Skip the start menu and use this mode",
     )
     parser.add_argument(
@@ -623,7 +628,7 @@ class GestureWorker:
         if phase == "vanished":
             seen = self.recognizer.detect_open_palm(image, timestamp_ms)
             return seen, f"open_palm={seen}"
-        if self.mode == "normal":
+        if self.mode != "naruto":
             name, score = recognize_gesture(self.recognizer, image, timestamp_ms)
             return name == "Victory" and score >= VICTORY_MIN_SCORE, f"{name} score={score:.2f}"
         seen = self.recognizer.recognize_joined_hands(image, timestamp_ms)
@@ -663,7 +668,8 @@ def set_fullscreen(enabled: bool) -> None:
 
 def self_test() -> int:
     """Check bundled resources and model initialization without opening a webcam."""
-    required = (SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, SOUND_PATH)
+    sounds = [path for mode in MODES for path in sound_paths(mode).values()]
+    required = (SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, *sounds)
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"Missing resources: {', '.join(missing)}")
@@ -706,9 +712,8 @@ def run_camera(
     resources.callback(recognizer.close)
     gestures = GestureWorker(recognizer, mode)
     resources.callback(gestures.close)  # stops before the recognizer closes
-    sound = VanishSound() if mode == "naruto" else None
-    if sound is not None:
-        resources.callback(sound.close)
+    sound = EffectSound(mode)
+    resources.callback(sound.close)
     resources.callback(cv2.destroyAllWindows)
     if commands is None and args.control_stdin:
         commands = start_stdin_commands()
@@ -738,18 +743,17 @@ def run_camera(
     if preview:
         print("[VanishCam] Preview keys: SPACE new background, V vanish, R reappear, F fullscreen, Q quit.")
 
-    def switch(action: str, now: float, current_cover: np.ndarray) -> None:
+    def switch(action: str, now: float, current_cover: np.ndarray, frame: np.ndarray) -> None:
         start = effect.vanish if action == "vanish" else effect.appear
-        if not start(now, current_cover):
+        if not start(now, current_cover, frame):
             return
         vanish_hold.block(now)
         appear_hold.block(now)
-        if sound is not None:
-            sound.play()
+        sound.play("out" if action == "vanish" else "in")
         if action == "vanish":
             say("Vanished. Show an open palm ✋ (or press Reappear) to come back.")
         else:
-            say(f"Back! Show {VANISH_POSE[mode]} to vanish again.")
+            say(f"Back! Show {vanish_pose(mode)} to vanish again.")
 
     try:
         while True:
@@ -791,7 +795,7 @@ def run_camera(
                     effect.reset()
                     vanish_hold.block(now, 0.5)
                     appear_hold.block(now, 0.5)
-                    say(f"Ready. Step back in and show {VANISH_POSE[mode]} to vanish.")
+                    say(f"Ready. Step back in and show {vanish_pose(mode)} to vanish.")
                 display = camera_frame
             else:
                 rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
@@ -810,10 +814,10 @@ def run_camera(
                     # Ignore results for a phase we have already left.
                     if checked_phase == effect.phase == "visible":
                         if vanish_hold.update(seen, checked_at):
-                            switch("vanish", now, cover)
+                            switch("vanish", now, cover, camera_frame)
                     elif checked_phase == effect.phase == "vanished":
                         if appear_hold.update(seen, checked_at):
-                            switch("appear", now, cover)
+                            switch("appear", now, cover, camera_frame)
                     if args.gesture_debug and now - last_gesture_report >= 1.0:
                         print(f"[Gesture] {detail}", flush=True)
                         last_gesture_report = now
@@ -845,7 +849,7 @@ def run_camera(
                 say("Step out of the frame for 4 seconds: capturing a new background.")
             elif command in ("vanish", "reappear") and not calibrating:
                 current = cover if cover is not None else np.zeros((height, width), np.float32)
-                switch("vanish" if command == "vanish" else "appear", now, current)
+                switch("vanish" if command == "vanish" else "appear", now, current, camera_frame)
             elif command == "fullscreen" and preview:
                 fullscreen = not fullscreen
                 set_fullscreen(fullscreen)

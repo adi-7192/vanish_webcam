@@ -21,7 +21,7 @@ import objc
 from AppKit import (
     NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered, NSColor,
     NSFloatingWindowLevel, NSFont, NSImage, NSImageScaleProportionallyUpOrDown,
-    NSImageView, NSMakeRect, NSMenu, NSMenuItem, NSObject, NSPanel, NSSegmentedControl,
+    NSImageView, NSMakeRect, NSMenu, NSMenuItem, NSObject, NSPanel, NSPopUpButton,
     NSStatusBar, NSTextField, NSButton, NSURL, NSUserDefaults, NSVariableStatusItemLength,
     NSWindowCollectionBehaviorCanJoinAllSpaces, NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowStyleMaskClosable, NSWindowStyleMaskHUDWindow, NSWindowStyleMaskNonactivatingPanel,
@@ -32,7 +32,15 @@ from PyObjCTools import AppHelper
 
 import vanish_cam
 
-MODES = (("normal", "Normal  ✌️"), ("naruto", "Naruto  🙏"))
+MODES = (
+    ("normal", "Dissolve  ✌️"),
+    ("dust", "Dust  ✌️"),
+    ("beam", "Teleport  ✌️"),
+    ("glitch", "Glitch  ✌️"),
+    ("portal", "Portal  ✌️"),
+    ("naruto", "Smoke puff  🙏"),
+)
+MODE_IDS = [mode for mode, _ in MODES]
 CAMERAS = range(4)
 THUMBNAIL_FPS = 8
 EXTENSION_SETTINGS = "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
@@ -110,7 +118,9 @@ class Controller(NSObject):
         if self is None:
             return None
         defaults = NSUserDefaults.standardUserDefaults()
-        self.mode = defaults.stringForKey_("mode") or "normal"
+        self.mode = defaults.stringForKey_("mode")
+        if self.mode not in MODE_IDS:
+            self.mode = "normal"
         self.camera = int(defaults.integerForKey_("camera"))
         self.last_thumbnail = 0.0
         self.engine = Engine(self.frameReady, self.engineStopped)
@@ -163,11 +173,11 @@ class Controller(NSObject):
         self.status.setFont_(NSFont.systemFontOfSize_(11))
         view.addSubview_(self.status)
 
-        self.segments = NSSegmentedControl.segmentedControlWithLabels_trackingMode_target_action_(
-            [label for _, label in MODES], 0, self, "modeChanged:"
-        )
-        self.segments.setFrame_(NSMakeRect(10, 160, 260, 28))
-        view.addSubview_(self.segments)
+        self.effect_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(10, 158, 260, 30), False)
+        self.effect_menu.addItemsWithTitles_([f"Effect: {label}" for _, label in MODES])
+        self.effect_menu.setTarget_(self)
+        self.effect_menu.setAction_("modeChanged:")
+        view.addSubview_(self.effect_menu)
 
         self.start_button = self.button("Start", "toggleEngine:", (10, 118, 260, 34))
         self.vanish_button = self.button("Vanish", "vanish:", (10, 78, 126, 34))
@@ -197,11 +207,15 @@ class Controller(NSObject):
         self.menuItem(menu, "Reappear", "reappear:", "r")
         self.menuItem(menu, "New background", "background:", "b")
         menu.addItem_(NSMenuItem.separatorItem())
+        effects = NSMenu.alloc().init()
         self.mode_items = {}
         for mode, label in MODES:
-            item = self.menuItem(menu, label.split()[0] + " mode", "pickMode:")
+            item = self.menuItem(effects, label, "pickMode:")
             item.setRepresentedObject_(mode)
             self.mode_items[mode] = item
+        effect_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Effect", None, "")
+        effect_item.setSubmenu_(effects)
+        menu.addItem_(effect_item)
         webcam = NSMenu.alloc().init()
         self.camera_items = {}
         for index in CAMERAS:
@@ -239,7 +253,7 @@ class Controller(NSObject):
         self.menu_start.setTitle_("Stop" if running else "Start")
         for button in (self.vanish_button, self.reappear_button, self.background_button):
             button.setEnabled_(running)
-        self.segments.setSelectedSegment_([m for m, _ in MODES].index(self.mode))
+        self.effect_menu.selectItemAtIndex_(MODE_IDS.index(self.mode))
         for mode, item in self.mode_items.items():
             item.setState_(1 if mode == self.mode else 0)
         for index, item in self.camera_items.items():
@@ -341,7 +355,7 @@ class Controller(NSObject):
 
     @objc.IBAction
     def modeChanged_(self, sender) -> None:
-        self.changeMode(MODES[sender.selectedSegment()][0])
+        self.changeMode(MODE_IDS[sender.indexOfSelectedItem()])
 
     @objc.IBAction
     def pickMode_(self, sender) -> None:

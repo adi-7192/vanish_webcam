@@ -9,7 +9,7 @@ resources = [
     (root / "models" / "gesture_recognizer.task", "models"),
     (root / "models" / "selfie_segmenter_landscape.tflite", "models"),
     (root / "assets" / "vanish.MP3", "assets"),
-]
+] + [(path, "assets/sounds") for path in sorted((root / "assets" / "sounds").glob("*.wav"))]
 missing = [str(path) for path, _ in resources if not path.is_file()]
 if missing:
     raise SystemExit("Missing build inputs:\n" + "\n".join(missing))
