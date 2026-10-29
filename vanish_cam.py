@@ -313,10 +313,9 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
         task_class = vision.HandLandmarker
         wrapper_class = MultiViewHandLandmarker
     else:
-        classifier_options = mp.tasks.components.processors.ClassifierOptions(
-            score_threshold=0.55,
-            category_allowlist=["Victory"],
-        )
+        # No canned-gesture allowlist: MediaPipe drops the landmarks of every
+        # hand whose gesture is filtered out, which would hide open palms and
+        # the landmark-based V check. classify_gesture_result picks "Victory".
         options = vision.GestureRecognizerOptions(
             base_options=hand_base_options(GESTURE_MODEL),
             running_mode=vision.RunningMode.VIDEO,
@@ -324,7 +323,6 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
             min_hand_detection_confidence=0.35,
             min_hand_presence_confidence=0.35,
             min_tracking_confidence=0.5,
-            canned_gesture_classifier_options=classifier_options,
         )
         task_class = vision.GestureRecognizer
         wrapper_class = MultiViewGestureRecognizer
@@ -434,145 +432,139 @@ def classify_gesture_result(
     return "No_Hand", 0.0
 
 
-class MultiViewGestureRecognizer:
-    """Retry detection on rotated and cropped views without disturbing tracking."""
-
-    def __init__(self, primary, alternate):
-        self.primary = primary
-        self.alternate = alternate
-        self.preferred_rotation: int | None = None
-        self.preferred_crop: str | None = None
-        self.next_retry_ms = 0
-        self.retry_cursor = 0
-
-    def recognize_gesture(self, image: mp.Image, timestamp_ms: int) -> tuple[str, float]:
-        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
-        best = classify_gesture_result(result, image)
-        if best[0] == "Victory":
-            self.preferred_rotation = None
-            self.preferred_crop = None
-            return best
-        if timestamp_ms < self.next_retry_ms:
-            return best
-
-        # IMAGE mode forces a fresh detection; the VIDEO model stays on the
-        # original frame, avoiding inconsistent timestamps across rotations.
-        rgb = image.numpy_view()
-        height, width = rgb.shape[:2]
-        # A sideways palm is often too small in the full frame. The two lower
-        # crops overlap and cover both hands, even when the image is mirrored.
-        crops = {
-            "full": rgb,
-            "lower_left": rgb[int(height * 0.28):, :int(width * 0.78)],
-            "lower_right": rgb[int(height * 0.28):, int(width * 0.22):],
-        }
-        views = [("full", rotation) for rotation in (0, 1, 3, 2)]
-        views += [(crop, rotation) for crop in ("lower_left", "lower_right")
-                  for rotation in (0, 1, 3)]
-        preferred = (self.preferred_crop, self.preferred_rotation)
-        selected = []
-        if preferred in views:
-            selected.append(preferred)
-        # Spread the expensive IMAGE attempts over successive video frames.
-        while len(selected) < 3:
-            view = views[self.retry_cursor % len(views)]
-            self.retry_cursor += 1
-            if view not in selected:
-                selected.append(view)
-        for crop, rotation in selected:
-            rotated = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=np.ascontiguousarray(np.rot90(crops[crop], rotation)),
-            )
-            result = self.alternate.recognize(hand_model_image(rotated))
-            candidate = classify_gesture_result(result, rotated)
-            if candidate[0] == "Victory":
-                self.preferred_rotation = rotation
-                self.preferred_crop = crop
-                self.next_retry_ms = timestamp_ms + int(GESTURE_INTERVAL_SECONDS * 1000)
-                return candidate
-            if candidate[0] == "Hand_Detected":
-                best = candidate
-        self.preferred_rotation = None
-        self.preferred_crop = None
-        self.next_retry_ms = timestamp_ms + int(GESTURE_INTERVAL_SECONDS * 1000)
-        return best
-
-    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
-        return open_palm_from_landmarks(result.hand_landmarks, image.width, image.height)
-
-    def close(self) -> None:
-        try:
-            self.primary.close()
-        finally:
-            self.alternate.close()
+# Retry views, tried a few per check on the IMAGE-mode model after the VIDEO
+# model misses. Upper tiles come first because hands are usually raised.
+RETRY_VIEWS = (
+    [(f"tile0{column}", 0) for column in range(3)]
+    + [(f"tile1{column}", 0) for column in range(3)]
+    + [("full", 1), ("full", 3)]
+)
+RETRY_INTERVAL_MS = 80
 
 
-class MultiViewHandLandmarker:
-    """Track two hands in video and retry difficult views with the hand model."""
+def hand_views(rgb: np.ndarray) -> dict[str, np.ndarray]:
+    """The whole view plus six overlapping zoomed tiles (2 rows x 3 columns).
+
+    MediaPipe shrinks the input to a small square before looking for hands,
+    so a hand at normal laptop distance can be too small in the full view.
+    """
+    height, width = rgb.shape[:2]
+    side = max(1, int(min(height, width) * 0.6))
+    views = {"full": rgb}
+    for row, top in enumerate((0, height - side)):
+        for column, left in enumerate((0, (width - side) // 2, width - side)):
+            views[f"tile{row}{column}"] = rgb[top:top + side, left:left + side]
+    return views
+
+
+def person_square(cover: np.ndarray | None, width: int, height: int,
+                  previous_center: float | None) -> tuple[int, float]:
+    """Left edge and smoothed centre of a full-height square around the person."""
+    side = min(width, height)
+    center = width / 2
+    if cover is not None:
+        columns = np.flatnonzero((cover > 0.3).any(axis=0))
+        if columns.size:
+            center = (columns[0] + columns[-1]) / 2
+    if previous_center is not None:
+        center = previous_center * 0.8 + center * 0.2
+    left = int(np.clip(center - side / 2, 0, width - side))
+    return left, center
+
+
+class MultiViewHands:
+    """VIDEO-mode tracking first, then zoomed/rotated IMAGE-mode retries."""
+
+    attempts_per_check = 3
 
     def __init__(self, primary, alternate):
         self.primary = primary
         self.alternate = alternate
         self.preferred_view: tuple[str, int] | None = None
         self.next_retry_ms = 0
-        self.last_hand_count = 0
         self.retry_cursor = 0
+        self.last_hand_count = 0
 
-    def recognize_joined_hands(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
-        self.last_hand_count = len(result.hand_landmarks)
-        if joined_hands_from_landmarks(result.hand_landmarks, image.width, image.height):
-            self.preferred_view = None
-            return True
+    def _search(self, image: mp.Image, timestamp_ms: int, detect, judge):
+        """Try retry views; ``judge`` returns a truthy value for a match."""
         if timestamp_ms < self.next_retry_ms:
-            return False
-
-        rgb = image.numpy_view()
-        height, width = rgb.shape[:2]
-        views = {
-            "full": rgb,
-            "center": rgb[int(height * 0.18):, int(width * 0.12):int(width * 0.88)],
-            "lower_left": rgb[int(height * 0.22):, :int(width * 0.78)],
-            "lower_right": rgb[int(height * 0.22):, int(width * 0.22):],
-        }
-        attempts = [("full", rotation) for rotation in (1, 3, 2)]
-        attempts += [("center", rotation) for rotation in (0, 1, 3)]
-        attempts += [("lower_left", 0), ("lower_right", 0)]
-        selected = []
-        if self.preferred_view in attempts:
-            selected.append(self.preferred_view)
-        while len(selected) < 2:
-            view = attempts[self.retry_cursor % len(attempts)]
+            return None
+        self.next_retry_ms = timestamp_ms + RETRY_INTERVAL_MS
+        views = hand_views(image.numpy_view())
+        selected = [self.preferred_view] if self.preferred_view in RETRY_VIEWS else []
+        while len(selected) < self.attempts_per_check:
+            view = RETRY_VIEWS[self.retry_cursor % len(RETRY_VIEWS)]
             self.retry_cursor += 1
             if view not in selected:
                 selected.append(view)
-        for crop, rotation in selected:
-            rotated = mp.Image(
+        for name, rotation in selected:
+            view = mp.Image(
                 image_format=mp.ImageFormat.SRGB,
-                data=np.ascontiguousarray(np.rot90(views[crop], rotation)),
+                data=np.ascontiguousarray(np.rot90(views[name], rotation)),
             )
-            result = self.alternate.detect(hand_model_image(rotated))
+            result = detect(hand_model_image(view))
             self.last_hand_count = max(self.last_hand_count, len(result.hand_landmarks))
-            if joined_hands_from_landmarks(result.hand_landmarks, rotated.width, rotated.height):
-                self.preferred_view = (crop, rotation)
-                self.next_retry_ms = timestamp_ms + 90
-                return True
+            verdict = judge(result, view)
+            if verdict:
+                self.preferred_view = (name, rotation)
+                return verdict
         self.preferred_view = None
-        self.next_retry_ms = timestamp_ms + 80
-        return False
-
-    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
-        self.last_hand_count = len(result.hand_landmarks)
-        return open_palm_from_landmarks(result.hand_landmarks, image.width, image.height)
+        return None
 
     def close(self) -> None:
         try:
             self.primary.close()
         finally:
             self.alternate.close()
+
+
+class MultiViewGestureRecognizer(MultiViewHands):
+    def recognize_gesture(self, image: mp.Image, timestamp_ms: int) -> tuple[str, float]:
+        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
+        self.last_hand_count = len(result.hand_landmarks)
+        best = classify_gesture_result(result, image)
+        if best[0] == "Victory":
+            return best
+
+        def judge(view_result, view):
+            candidate = classify_gesture_result(view_result, view)
+            return candidate if candidate[0] == "Victory" else None
+
+        found = self._search(image, timestamp_ms, self.alternate.recognize, judge)
+        if found:
+            return found
+        if best[0] == "No_Hand" and self.last_hand_count:
+            return "Hand_Detected", 0.0
+        return best
+
+    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
+        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
+        self.last_hand_count = len(result.hand_landmarks)
+        if open_palm_from_landmarks(result.hand_landmarks, image.width, image.height):
+            return True
+        judge = lambda found, view: open_palm_from_landmarks(found.hand_landmarks, view.width, view.height)
+        return bool(self._search(image, timestamp_ms, self.alternate.recognize, judge))
+
+
+class MultiViewHandLandmarker(MultiViewHands):
+    attempts_per_check = 2
+
+    def recognize_joined_hands(self, image: mp.Image, timestamp_ms: int) -> bool:
+        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
+        self.last_hand_count = len(result.hand_landmarks)
+        if joined_hands_from_landmarks(result.hand_landmarks, image.width, image.height):
+            return True
+        judge = lambda found, view: joined_hands_from_landmarks(found.hand_landmarks, view.width, view.height)
+        return bool(self._search(image, timestamp_ms, self.alternate.detect, judge))
+
+    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
+        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
+        self.last_hand_count = len(result.hand_landmarks)
+        if open_palm_from_landmarks(result.hand_landmarks, image.width, image.height):
+            return True
+        judge = lambda found, view: open_palm_from_landmarks(found.hand_landmarks, view.width, view.height)
+        return bool(self._search(image, timestamp_ms, self.alternate.detect, judge))
+
 
 
 def recognize_gesture(
@@ -660,6 +652,7 @@ def run_camera(
     last_gesture_check = float("-inf")
     last_gesture_report = 0.0
     last_timestamp = -1
+    square_center: float | None = None
     say("Step out of the frame for 4 seconds: capturing the background.")
     if preview:
         print("[VanishCam] Preview keys: SPACE new background, V vanish, R reappear, F fullscreen, Q quit.")
@@ -724,21 +717,26 @@ def run_camera(
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 cover = cover_mask(person_mask(segmenter, mp_image, timestamp, width, height), cover)
                 background.update(camera_frame, cover)
+                # Look for hands in a square around the person, not the wide frame.
+                square_left, square_center = person_square(cover, width, height, square_center)
+                side = min(width, height)
+                hand_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(
+                    rgb[:side, square_left:square_left + side]))
 
                 if effect.phase in ("visible", "vanished") and now - last_gesture_check >= gesture_interval:
                     last_gesture_check = now
                     if effect.phase == "visible":
                         if mode == "normal":
-                            name, score = recognize_gesture(recognizer, mp_image, timestamp)
+                            name, score = recognize_gesture(recognizer, hand_image, timestamp)
                             seen = name == "Victory" and score >= VICTORY_MIN_SCORE
                             detail = f"{name} score={score:.2f}"
                         else:
-                            seen = recognizer.recognize_joined_hands(mp_image, timestamp)
+                            seen = recognizer.recognize_joined_hands(hand_image, timestamp)
                             detail = f"hands={recognizer.last_hand_count} joined={seen}"
                         if vanish_hold.update(seen, now):
                             switch("vanish", now, cover)
                     else:
-                        seen = recognizer.detect_open_palm(mp_image, timestamp)
+                        seen = recognizer.detect_open_palm(hand_image, timestamp)
                         detail = f"open_palm={seen}"
                         if appear_hold.update(seen, now):
                             switch("appear", now, cover)

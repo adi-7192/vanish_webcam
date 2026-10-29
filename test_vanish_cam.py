@@ -135,42 +135,14 @@ class MultiViewTests(unittest.TestCase):
             gestures=[[SimpleNamespace(category_name="Victory", score=0.9)]],
         )
         self.image = mp.Image(
-            image_format=mp.ImageFormat.SRGB, data=np.zeros((32, 48, 3), dtype=np.uint8)
+            image_format=mp.ImageFormat.SRGB, data=np.zeros((100, 100, 3), dtype=np.uint8)
         )
 
-    def test_rotated_detection_and_preferred_view_are_used(self):
-        calls = []
-
-        def recognize(image):
-            calls.append((image.width, image.height))
-            return self.victory if image.width == 32 else self.empty
-
-        detector = MultiViewGestureRecognizer(
+    def detector(self, recognize):
+        return MultiViewGestureRecognizer(
             SimpleNamespace(recognize_for_video=lambda image, timestamp: self.empty),
             SimpleNamespace(recognize=recognize),
         )
-        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "Victory")
-        self.assertEqual(calls, [(48, 32), (32, 48)])
-        self.assertEqual(detector.preferred_rotation, 1)
-        calls.clear()
-        self.assertEqual(recognize_gesture(detector, self.image, 1140)[0], "Victory")
-        self.assertEqual(calls, [(32, 48)])
-
-    def test_failed_search_is_throttled_without_reusing_old_positive(self):
-        calls = []
-        alternate = SimpleNamespace(recognize=lambda image: calls.append(image) or self.empty)
-        detector = MultiViewGestureRecognizer(
-            SimpleNamespace(recognize_for_video=lambda image, timestamp: self.empty), alternate
-        )
-        # Retries are spread over frames: three views per attempt, then a pause.
-        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "No_Hand")
-        self.assertEqual(len(calls), 3)
-        recognize_gesture(detector, self.image, 1100)
-        self.assertEqual(len(calls), 3)
-        alternate.recognize = lambda image: self.victory
-        self.assertEqual(recognize_gesture(detector, self.image, 1420)[0], "Victory")
-        alternate.recognize = lambda image: self.empty
-        self.assertEqual(recognize_gesture(detector, self.image, 1560)[0], "No_Hand")
 
     def test_primary_victory_avoids_extra_inference(self):
         calls = []
@@ -181,25 +153,66 @@ class MultiViewTests(unittest.TestCase):
         self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "Victory")
         self.assertEqual(calls, [])
 
-    def test_lower_hand_crop_recovers_a_small_sideways_v(self):
+    def test_zoomed_tile_finds_a_small_hand_and_is_preferred_next_time(self):
         calls = []
 
         def recognize(image):
             calls.append((image.width, image.height))
-            return self.victory if (image.width, image.height) == (37, 24) else self.empty
+            # Only the 60x60 zoomed tiles "see" the hand.
+            return self.victory if image.width == 60 else self.empty
 
-        detector = MultiViewGestureRecognizer(
-            SimpleNamespace(recognize_for_video=lambda image, timestamp: self.empty),
-            SimpleNamespace(recognize=recognize),
-        )
-        # The first attempt covers full-frame views; the lower crop comes next.
-        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "No_Hand")
-        self.assertEqual(recognize_gesture(detector, self.image, 1140)[0], "Victory")
-        self.assertEqual(detector.preferred_crop, "lower_left")
-        self.assertEqual(detector.preferred_rotation, 0)
+        detector = self.detector(recognize)
+        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "Victory")
+        self.assertEqual(calls, [(60, 60)])
+        self.assertEqual(detector.preferred_view, ("tile00", 0))
         calls.clear()
-        self.assertEqual(recognize_gesture(detector, self.image, 1280)[0], "Victory")
-        self.assertEqual(calls, [(37, 24)])
+        self.assertEqual(recognize_gesture(detector, self.image, 1100)[0], "Victory")
+        self.assertEqual(calls[0], (60, 60))
+
+    def test_failed_search_is_spread_over_checks_and_throttled(self):
+        calls = []
+        detector = self.detector(lambda image: calls.append(image) or self.empty)
+        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "No_Hand")
+        self.assertEqual(len(calls), 3)
+        recognize_gesture(detector, self.image, 1040)  # within the retry interval
+        self.assertEqual(len(calls), 3)
+        recognize_gesture(detector, self.image, 1100)
+        self.assertEqual(len(calls), 6)
+
+    def test_rotated_full_view_is_tried_after_the_tiles(self):
+        def recognize(image):
+            return self.victory if (image.width, image.height) == (100, 100) else self.empty
+
+        detector = self.detector(recognize)
+        found = [recognize_gesture(detector, self.image, 1000 + step * 100)[0] for step in range(3)]
+        self.assertEqual(found[-1], "Victory")
+        self.assertEqual(detector.preferred_view, ("full", 1))
+
+    def test_hand_views_cover_the_image_with_zoomed_tiles(self):
+        views = vanish_cam.hand_views(np.zeros((540, 540, 3), np.uint8))
+        self.assertEqual(len(views), 7)
+        self.assertEqual(views["tile00"].shape[:2], (324, 324))
+        self.assertEqual(views["tile12"].shape[:2], (324, 324))
+
+    def test_person_square_follows_the_person_smoothly(self):
+        cover = np.zeros((540, 960), np.float32)
+        cover[:, 700:900] = 1.0
+        left, center = vanish_cam.person_square(cover, 960, 540, None)
+        self.assertEqual(left, 420)  # clamped to the right edge
+        left, smoothed = vanish_cam.person_square(np.zeros((540, 960), np.float32), 960, 540, 800.0)
+        self.assertAlmostEqual(smoothed, 800 * 0.8 + 480 * 0.2)
+
+
+class GestureModelOptionsTests(unittest.TestCase):
+    def test_no_gesture_allowlist_so_all_hands_keep_their_landmarks(self):
+        created = []
+        fake = SimpleNamespace(create_from_options=lambda options: created.append(options) or SimpleNamespace(close=lambda: None))
+        with patch.object(vanish_cam.vision, "GestureRecognizer", fake), \
+                patch.object(vanish_cam.vision.ImageSegmenter, "create_from_options"):
+            vanish_cam.create_tasks("normal")
+        options = created[0]
+        classifier = getattr(options, "canned_gesture_classifier_options", None)
+        self.assertIsNone(getattr(classifier, "category_allowlist", None))
 
 
 class HandModelImageTests(unittest.TestCase):

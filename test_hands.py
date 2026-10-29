@@ -62,7 +62,7 @@ class JoinedHandsTests(unittest.TestCase):
         self.assertEqual(recognizer.last_hand_count, 2)
         alternate.detect.assert_not_called()
 
-    def test_hand_model_recovers_joined_hands_in_a_cropped_view(self):
+    def test_hand_model_recovers_joined_hands_in_a_zoomed_view(self):
         primary, alternate = Mock(), Mock()
         primary.detect_for_video.return_value = SimpleNamespace(hand_landmarks=[pressed_hand(0.45)])
         alternate.detect.side_effect = [
@@ -71,8 +71,15 @@ class JoinedHandsTests(unittest.TestCase):
         ]
         recognizer = app.MultiViewHandLandmarker(primary, alternate)
         self.assertTrue(recognizer.recognize_joined_hands(image(), 100))
-        self.assertEqual(recognizer.preferred_view, ("full", 3))
+        self.assertEqual(recognizer.preferred_view, ("tile01", 0))
         self.assertEqual(recognizer.last_hand_count, 2)
+
+    def test_open_palm_falls_back_to_zoomed_views(self):
+        primary, alternate = Mock(), Mock()
+        primary.detect_for_video.return_value = SimpleNamespace(hand_landmarks=[])
+        alternate.detect.return_value = SimpleNamespace(hand_landmarks=[open_hand()])
+        recognizer = app.MultiViewHandLandmarker(primary, alternate)
+        self.assertTrue(recognizer.detect_open_palm(image(), 100))
 
 
 class OpenPalmTests(unittest.TestCase):

@@ -18,7 +18,7 @@ SMOKE_SECONDS = 1.45        # Naruto: length of the smoke puff.
 SMOKE_SWAP_SECONDS = 0.13   # Naruto: person swaps while the smoke is densest.
 BACKGROUND_LEARN_RATE = 0.04
 GESTURE_HOLD_SECONDS = 0.35
-GESTURE_GAP_SECONDS = 0.3
+GESTURE_GAP_SECONDS = 0.45  # small hands blink in and out of detection
 GESTURE_COOLDOWN_SECONDS = 1.2
 FINGER_BASES = (5, 9, 13, 17)  # MCP landmark of index, middle, ring and little finger.
 
