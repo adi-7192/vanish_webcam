@@ -62,77 +62,126 @@ class VirtualCameraTests(unittest.TestCase):
         self.assertTrue((sent == 42).all())
 
 
+class FakeCamera:
+    """Webcam whose frames also advance a fake clock (30 fps)."""
+
+    def __init__(self, frames, clock):
+        self.frames, self.clock = list(frames), clock
+        self.release = Mock()
+
+    def read(self):
+        self.clock[0] += 1 / 30
+        return (True, self.frames.pop(0)) if self.frames else (False, None)
+
+    def set(self, *args):
+        pass
+
+
+def person_scene(count, height=24, width=40):
+    room = np.full((height, width, 3), 100, np.uint8)
+    person = room.copy()
+    person[6:20, 14:26] = 220
+    mask = np.zeros((height, width), np.float32)
+    mask[6:20, 14:26] = 1.0
+    calibration = int(app.CALIBRATION_SECONDS * 30) + 2
+    return [room] * calibration + [person] * count, room, mask
+
+
 class VideoLoopTests(unittest.TestCase):
-    def run_mock_video(self, send_error=None, gesture=("No_Hand", 0.0), headless=False):
-        capture = Mock()
-        frames = [np.full((24, 40, 3), color, np.uint8) for color in (10, 40, 80, 120, 160)]
-        capture.read.side_effect = [(True, frame) for frame in frames]
-        segmenter, recognizer = Mock(), Mock()
-        camera = Mock(width=40, height=24)
+    def run_loop(self, frames, mask, mode="normal", gestures=None, palms=None,
+                 remote=None, headless=False, send_error=None):
+        clock = [0.0]
+        capture = FakeCamera(frames, clock)
+        segmenter = Mock()
+        recognizer = Mock()
+        recognizer.last_hand_count = 0
+        gestures = list(gestures or [])
+        palms = list(palms or [])
+        recognizer.detect_open_palm.side_effect = lambda image, ts: palms.pop(0) if palms else False
+        recognizer.recognize_joined_hands.side_effect = lambda image, ts: gestures.pop(0) if gestures else False
+        victory = lambda *args: ("Victory", 0.9) if (gestures.pop(0) if gestures else False) else ("No_Hand", 0.0)
+        camera = Mock(width=frames[0].shape[1], height=frames[0].shape[0])
         camera.send.side_effect = send_error
-        displayed = []
+        remote = list(remote or [])
+        sent = []
+        camera.send.side_effect = send_error or (lambda frame: sent.append(frame.copy()))
+        args = arguments(mode=mode, no_preview=headless, control_stdin=headless)
         with ExitStack() as mocks:
-            args = arguments(no_preview=headless, control_stdin=headless)
             mocks.enter_context(patch.object(app, "parse_args", return_value=args))
             mocks.enter_context(patch.object(app, "download_models"))
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(segmenter, recognizer)))
-            opening = mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=camera))
-            mocks.enter_context(patch.object(app, "person_mask", return_value=np.ones((24, 40), np.float32)))
-            mocks.enter_context(patch.object(app, "recognize_gesture", return_value=gesture))
-            times = (0, 0, 0.1, 4.1, 4.3, 4.35, 5.0, 5.02, 8.2, 8.23)
-            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=times))
-            mocks.enter_context(patch.object(app.cv2, "namedWindow"))
-            mocks.enter_context(patch.object(app.cv2, "resizeWindow"))
-            destroy = mocks.enter_context(patch.object(app.cv2, "destroyAllWindows"))
-            mocks.enter_context(patch.object(app.cv2, "imshow", side_effect=lambda name, frame: displayed.append(frame.copy())))
-            keys = (0, 0, ord("v") if gesture[0] != "Victory" else 0, 0, ord("q"))
-            waitkey = mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=keys))
+            mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=camera))
+            mocks.enter_context(patch.object(app, "VanishSound", return_value=Mock()))
+            mocks.enter_context(patch.object(app, "person_mask", return_value=mask))
+            mocks.enter_context(patch.object(app, "recognize_gesture", side_effect=victory))
+            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=lambda: clock[0]))
+            for name in ("namedWindow", "resizeWindow", "destroyAllWindows", "imshow"):
+                mocks.enter_context(patch.object(app.cv2, name))
+            mocks.enter_context(patch.object(app.cv2, "waitKey", return_value=0))
+            mocks.enter_context(patch.object(app.cv2, "putText", side_effect=AssertionError("No overlays")))
             mocks.enter_context(patch.object(app, "start_stdin_commands", return_value=Mock()))
-            remote = [None, None, "vanish", None, "quit"] if headless else []
             mocks.enter_context(patch.object(
                 app, "next_command", side_effect=lambda commands: remote.pop(0) if remote else None
             ))
-            mocks.enter_context(patch.object(app.cv2, "putText", side_effect=AssertionError("Overlay vietato")))
             mocks.enter_context(patch("builtins.print"))
-            if send_error is None:
-                self.assertEqual(app.run(), 0)
-            else:
-                with self.assertRaisesRegex(RuntimeError, "send failed"):
+            if send_error is not None:
+                with self.assertRaises(type(send_error)):
                     app.run()
-            opening.assert_called_once()
-            self.assertEqual(opening.call_args.args[1:], (40, 24))
-            capture.release.assert_called_once()
-            segmenter.close.assert_called_once()
-            recognizer.close.assert_called_once()
-            camera.close.assert_called_once()
-            destroy.assert_called_once()
-            if headless:
-                waitkey.assert_not_called()
-        return frames, camera, displayed
+            else:
+                with self.assertRaisesRegex(RuntimeError, "stopped sending"):
+                    app.run()  # the fake webcam runs out of frames
+        capture.release.assert_called_once()
+        segmenter.close.assert_called_once()
+        recognizer.close.assert_called_once()
+        camera.close.assert_called_once()
+        return sent, recognizer
 
-    def test_preview_and_virtual_output_are_clean_in_all_phases(self):
-        frames, camera, displayed = self.run_mock_video()
-        self.assertEqual(len(displayed), 5)
-        for sent, preview in zip(camera.send.call_args_list, displayed):
-            np.testing.assert_array_equal(sent.args[0], preview)
-        np.testing.assert_array_equal(displayed[0], frames[0])  # Calibrazione.
-        np.testing.assert_array_equal(displayed[2], frames[2])  # Pronto.
-        np.testing.assert_array_equal(displayed[4], frames[1])  # Sparito: solo sfondo.
+    def test_gesture_held_vanishes_and_open_palm_brings_you_back(self):
+        frames, room, mask = person_scene(260)
+        start = int(app.CALIBRATION_SECONDS * 30) + 2
+        # V sign on ~5 checks (0.7 s), then open palm on ~5 checks after vanishing.
+        gestures = [True] * 5
+        palms = [False] * 15 + [True] * 6
+        sent, recognizer = self.run_loop(frames, mask, gestures=gestures, palms=palms)
+        self.assertEqual(len(sent), len(frames))
+        np.testing.assert_array_equal(sent[start], frames[start])  # visible at first
+        vanished = [i for i, frame in enumerate(sent) if (frame[12, 20] == room[12, 20]).all()]
+        self.assertTrue(vanished, "person never vanished")
+        first_gone = vanished[0]
+        np.testing.assert_array_equal(sent[first_gone][:, :5], room[:, :5])  # room stays live
+        self.assertTrue(recognizer.detect_open_palm.called)
+        np.testing.assert_array_equal(sent[-1], frames[-1])  # back again at the end
+        self.assertGreater(len(sent) - 1, vanished[-1])
 
-    def test_first_gesture_starts_dissolve_in_preview_and_virtual_output(self):
-        frames, camera, displayed = self.run_mock_video(gesture=("Victory", 0.9))
-        np.testing.assert_array_equal(camera.send.call_args_list[2].args[0], displayed[2])
-        self.assertTrue(np.any(displayed[3] != frames[3]))  # Animazione in corso.
-        self.assertTrue(np.any(displayed[3] != frames[1]))  # Non ancora sparito.
-        np.testing.assert_array_equal(displayed[4], frames[1])  # Animazione completata.
+    def test_single_frame_gesture_does_not_trigger(self):
+        frames, room, mask = person_scene(60)
+        sent, _ = self.run_loop(frames, mask, gestures=[True, False, False, False, True])
+        for frame, original in zip(sent, frames):
+            np.testing.assert_array_equal(frame, original)
+
+    def test_naruto_palms_together_then_open_palm(self):
+        frames, room, mask = person_scene(200, height=48, width=80)
+        mask = np.zeros((48, 80), np.float32)
+        mask[10:40, 30:50] = 1.0
+        for frame in frames[int(app.CALIBRATION_SECONDS * 30) + 2:]:
+            frame[10:40, 30:50] = 220
+        sent, recognizer = self.run_loop(frames, mask, mode="naruto",
+                                         gestures=[True] * 8, palms=[False] * 25 + [True] * 8)
+        self.assertTrue(any((frame[25, 40] == 100).all() for frame in sent))
+        np.testing.assert_array_equal(sent[-1], frames[-1])
 
     def test_headless_run_is_driven_by_remote_commands(self):
-        frames, camera, displayed = self.run_mock_video(headless=True)
-        self.assertEqual(displayed, [])
-        self.assertEqual(camera.send.call_count, 5)
-        np.testing.assert_array_equal(camera.send.call_args_list[2].args[0], frames[2])
-        np.testing.assert_array_equal(camera.send.call_args_list[4].args[0], frames[1])
+        frames, room, mask = person_scene(170)
+        start = int(app.CALIBRATION_SECONDS * 30) + 2
+        remote = [None] * (start + 5) + ["vanish"] + [None] * 90 + ["reappear"]
+        sent, _ = self.run_loop(frames, mask, remote=remote, headless=True)
+        self.assertTrue(any((frame[12, 20] == room[12, 20]).all() for frame in sent))
+        np.testing.assert_array_equal(sent[-1], frames[-1])
+
+    def test_all_devices_close_on_send_error(self):
+        frames, _, mask = person_scene(5)
+        self.run_loop(frames, mask, send_error=RuntimeError("send failed"))
 
     def test_headless_without_virtual_camera_stops(self):
         capture = Mock()
@@ -147,9 +196,6 @@ class VideoLoopTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "OBS Virtual Camera is required"):
                 app.run()
         capture.release.assert_called_once()
-
-    def test_all_devices_close_on_send_error(self):
-        self.run_mock_video(send_error=RuntimeError("send failed"))
 
 
 class StdinCommandTests(unittest.TestCase):

@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -21,18 +21,11 @@ import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-try:
-    from .naruto_effect import (
-        EFFECT_SECONDS, joined_hands_from_landmarks, landed_log_anchor,
-        load_log, overlay_log, render_substitution, substitution_anchor,
-    )
-    from .vanish_sound import SOUND_PATH, VanishSound
-except ImportError:
-    from naruto_effect import (
-        EFFECT_SECONDS, joined_hands_from_landmarks, landed_log_anchor,
-        load_log, overlay_log, render_substitution, substitution_anchor,
-    )
-    from vanish_sound import SOUND_PATH, VanishSound
+from effects import (
+    GestureHold, LiveBackground, VanishEffect, cover_mask,
+    joined_hands_from_landmarks, open_palm_from_landmarks,
+)
+from vanish_sound import SOUND_PATH, VanishSound
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -74,17 +67,10 @@ CONTROL_COMMANDS = frozenset(KEY_COMMANDS.values()) | {"preview"}
 
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
-VANISH_SECONDS = 3.6
 GESTURE_INTERVAL_SECONDS = 0.14
-
-
-@dataclass
-class AppState:
-    phase: str = "calibrating"
-    calibration_started: float = 0.0
-    vanish_started: float | None = None
-    last_gesture_check: float = 0.0
-    fullscreen: bool = False
+NARUTO_GESTURE_INTERVAL_SECONDS = 0.08
+VICTORY_MIN_SCORE = 0.62
+VANISH_POSE = {"normal": "a V sign ✌️", "naruto": "palms together 🙏"}
 
 
 def positive_fps(value: str) -> float:
@@ -142,7 +128,7 @@ def choose_mode() -> str | None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.85, (236, 239, 242), 2, cv2.LINE_AA)
     buttons = (
         ("normal", "1  NORMAL VANISH", "V sign  /  dissolve", 140),
-        ("naruto", "2  NARUTO VANISH", "Palms together  /  log and smoke", 260),
+        ("naruto", "2  NARUTO VANISH", "Palms together  /  smoke puff", 260),
     )
     for mode, heading, detail, top in buttons:
         cv2.rectangle(window, (65, top), (635, top + 94), (48, 54, 62), -1, cv2.LINE_AA)
@@ -359,34 +345,6 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
     return segmenter, wrapper_class(primary, alternate)
 
 
-def smoothstep(edge0: float, edge1: float, values: np.ndarray) -> np.ndarray:
-    values = np.clip((values - edge0) / max(edge1 - edge0, 1e-6), 0.0, 1.0)
-    return values * values * (3.0 - 2.0 * values)
-
-
-def ease_in_out_cubic(value: float) -> float:
-    if value < 0.5:
-        return 4.0 * value * value * value
-    return 1.0 - ((-2.0 * value + 2.0) ** 3) / 2.0
-
-
-def make_dissolve_fields(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(7391)
-    y, x = np.mgrid[0:height, 0:width]
-    y_normal = y.astype(np.float32) / max(height - 1, 1)
-    x_normal = x.astype(np.float32) / max(width - 1, 1)
-    low_noise = rng.random((max(2, height // 10), max(2, width // 10)), dtype=np.float32)
-    low_noise = cv2.resize(low_noise, (width, height), interpolation=cv2.INTER_CUBIC)
-    fine_noise = rng.random((height, width), dtype=np.float32)
-    field = (
-        (1.0 - y_normal) * 0.72
-        + low_noise * 0.17
-        + fine_noise * 0.08
-        + np.sin(x_normal * 18.0) * 0.025
-    )
-    return np.clip(field, 0.0, 1.0), fine_noise
-
-
 def person_mask(
     segmenter: vision.ImageSegmenter,
     image: mp.Image,
@@ -401,61 +359,6 @@ def person_mask(
     resized = cv2.resize(raw, (width, height), interpolation=cv2.INTER_LINEAR)
     resized = cv2.GaussianBlur(resized, (0, 0), sigmaX=2.2, sigmaY=2.2)
     return np.clip((resized - 0.12) / 0.68, 0.0, 1.0)
-
-
-def alpha_composite(person: np.ndarray, background: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-    alpha_3 = alpha[:, :, None]
-    return (
-        person.astype(np.float32) * alpha_3
-        + background.astype(np.float32) * (1.0 - alpha_3)
-    ).astype(np.uint8)
-
-
-def apply_dissolve(
-    frame: np.ndarray,
-    background: np.ndarray,
-    mask: np.ndarray,
-    progress: float,
-    field: np.ndarray,
-    sparkle_noise: np.ndarray,
-) -> np.ndarray:
-    if progress <= 0.002:
-        return alpha_composite(frame, background, mask)
-    if progress >= 0.999:
-        return background.copy()
-
-    points = cv2.findNonZero((mask > 0.01).astype(np.uint8))
-    if points is None:
-        return background.copy()
-    x, y, width, height = cv2.boundingRect(points)
-    left, top = max(0, x - 18), max(0, y - 18)
-    right = min(mask.shape[1], x + width + 18)
-    bottom = min(mask.shape[0], y + height + 18)
-    area = np.s_[top:bottom, left:right]
-    mask = mask[area]
-    field = field[area]
-    sparkle_noise = sparkle_noise[area]
-    eased = ease_in_out_cubic(progress)
-    survival = smoothstep(eased - 0.055, eased + 0.055, field)
-    alpha = mask * survival
-    output = alpha_composite(frame[area], background[area], alpha)
-    edge = (
-        (np.abs(field - eased) < 0.018)
-        & (mask > 0.48)
-        & (sparkle_noise > 0.54)
-    ).astype(np.float32)
-    glow = cv2.GaussianBlur(edge, (0, 0), sigmaX=5.0, sigmaY=5.0)
-    glow = np.clip(glow * 5.0 + edge, 0.0, 1.0)[:, :, None]
-    cyan = np.full_like(output, (255, 228, 92), dtype=np.uint8)
-    result = np.clip(
-        output.astype(np.float32) * (1.0 - glow * 0.8)
-        + cyan.astype(np.float32) * glow * 0.8,
-        0,
-        255,
-    ).astype(np.uint8)
-    canvas = background.copy()
-    canvas[area] = result
-    return canvas
 
 
 def victory_landmark_score(points: np.ndarray) -> float:
@@ -595,6 +498,10 @@ class MultiViewGestureRecognizer:
         self.next_retry_ms = timestamp_ms + int(GESTURE_INTERVAL_SECONDS * 1000)
         return best
 
+    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
+        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
+        return open_palm_from_landmarks(result.hand_landmarks, image.width, image.height)
+
     def close(self) -> None:
         try:
             self.primary.close()
@@ -656,6 +563,11 @@ class MultiViewHandLandmarker:
         self.next_retry_ms = timestamp_ms + 80
         return False
 
+    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
+        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
+        self.last_hand_count = len(result.hand_landmarks)
+        return open_palm_from_landmarks(result.hand_landmarks, image.width, image.height)
+
     def close(self) -> None:
         try:
             self.primary.close()
@@ -673,23 +585,6 @@ def recognize_gesture(
     return classify_gesture_result(recognizer.recognize_for_video(image, timestamp_ms), image)
 
 
-def start_vanish_on_gesture(state: AppState, name: str, score: float, now: float) -> bool:
-    """Start the dissolve on the first confident V sign."""
-    if state.phase == "ready" and name == "Victory" and score >= 0.62:
-        state.phase = "vanishing"
-        state.vanish_started = now
-        return True
-    return False
-
-
-def start_naruto_on_join(state: AppState, joined: bool, now: float) -> bool:
-    if state.phase == "ready" and joined:
-        state.phase = "naruto_vanishing"
-        state.vanish_started = now
-        return True
-    return False
-
-
 def set_fullscreen(enabled: bool) -> None:
     mode = cv2.WINDOW_FULLSCREEN if enabled else cv2.WINDOW_NORMAL
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, mode)
@@ -701,7 +596,6 @@ def self_test() -> int:
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"Missing resources: {', '.join(missing)}")
-    load_log()
     for mode in ("normal", "naruto"):
         segmenter, recognizer = create_tasks(mode)
         try:
@@ -739,45 +633,55 @@ def run_camera(
     segmenter, recognizer = create_tasks(mode)
     resources.callback(segmenter.close)
     resources.callback(recognizer.close)
-    log_sprite = load_log() if mode == "naruto" else None
-    vanish_sound = VanishSound() if mode == "naruto" else None
-    if vanish_sound is not None:
-        resources.callback(vanish_sound.close)
+    sound = VanishSound() if mode == "naruto" else None
+    if sound is not None:
+        resources.callback(sound.close)
     resources.callback(cv2.destroyAllWindows)
     if commands is None and args.control_stdin:
         commands = start_stdin_commands()
     preview = not args.no_preview
-
-    state = AppState(
-        calibration_started=time.perf_counter(), fullscreen=args.fullscreen
-    )
+    fullscreen = args.fullscreen
     if preview:
-        open_preview(args.width, args.height, state.fullscreen)
+        open_preview(args.width, args.height, fullscreen)
 
-    background: np.ndarray | None = None
-    background_samples: list[np.ndarray] = []
-    last_mask: np.ndarray | None = None
-    last_mask_at = float("-inf")
-    dissolve_field: np.ndarray | None = None
-    sparkle_noise: np.ndarray | None = None
-    log_anchor: tuple[int, int, int] | None = None
-    log_cache: dict[int, np.ndarray] = {}
-    vanished_frame: np.ndarray | None = None
+    effect = VanishEffect(mode)
+    vanish_hold, appear_hold = GestureHold(), GestureHold()
+    gesture_interval = (NARUTO_GESTURE_INTERVAL_SECONDS if mode == "naruto"
+                        else GESTURE_INTERVAL_SECONDS)
+    background: LiveBackground | None = None
+    samples: list[np.ndarray] = []
+    cover: np.ndarray | None = None
     virtual_camera = None
     virtual_camera_initialized = False
-    calibration_remaining = None
-    last_gesture_report = 0.0
     started = time.perf_counter()
+    calibrating = True
+    calibration_started = started
+    calibration_remaining = None
+    last_gesture_check = float("-inf")
+    last_gesture_report = 0.0
+    last_timestamp = -1
     say("Step out of the frame for 4 seconds: capturing the background.")
     if preview:
-        print("[VanishCam] Preview keys: SPACE new background, R reappear, V vanish, F fullscreen, Q quit.")
+        print("[VanishCam] Preview keys: SPACE new background, V vanish, R reappear, F fullscreen, Q quit.")
+
+    def switch(action: str, now: float, current_cover: np.ndarray) -> None:
+        start = effect.vanish if action == "vanish" else effect.appear
+        if not start(now, current_cover):
+            return
+        vanish_hold.block(now)
+        appear_hold.block(now)
+        if sound is not None:
+            sound.play()
+        if action == "vanish":
+            say("Vanished. Show an open palm ✋ (or press Reappear) to come back.")
+        else:
+            say(f"Back! Show {VANISH_POSE[mode]} to vanish again.")
 
     try:
         while True:
             ok, camera_frame = capture.read()
             if not ok:
                 raise RuntimeError("The webcam stopped sending images.")
-
             if not args.no_mirror:
                 camera_frame = cv2.flip(camera_frame, 1)
 
@@ -791,116 +695,59 @@ def run_camera(
                     raise RuntimeError(
                         "Without the preview window, the OBS Virtual Camera is required."
                     )
-            if mode == "normal" and (dissolve_field is None or dissolve_field.shape != (height, width)):
-                dissolve_field, sparkle_noise = make_dissolve_fields(height, width)
             now = time.perf_counter()
+            # MediaPipe VIDEO mode needs strictly increasing timestamps.
+            timestamp = max(last_timestamp + 1, int((now - started) * 1000))
+            last_timestamp = timestamp
 
-            elapsed_ms = int((now - started) * 1000)
-            mp_image = None
-
-            if state.phase == "calibrating":
-                elapsed = now - state.calibration_started
+            if calibrating:
+                elapsed = now - calibration_started
                 remaining = max(0, int(np.ceil(CALIBRATION_SECONDS - elapsed)))
-                if remaining != calibration_remaining:
+                if remaining != calibration_remaining and remaining > 0:
                     say(f"Capturing background: {remaining} s left. Stay out of the frame.")
-                    calibration_remaining = remaining
+                calibration_remaining = remaining
                 if elapsed >= CALIBRATION_SECONDS - BACKGROUND_SAMPLE_SECONDS:
-                    background_samples.append(camera_frame.copy())
+                    samples.append(camera_frame.copy())
                 if elapsed >= CALIBRATION_SECONDS:
-                    if background_samples:
-                        stack = np.stack(background_samples[-18:], axis=0)
-                        background = np.median(stack, axis=0).astype(np.uint8)
-                    else:
-                        background = camera_frame.copy()
-                    background_samples.clear()
-                    state.phase = "ready"
-                    say("Ready. Step back in and make the gesture to vanish.")
+                    stack = np.stack(samples[-18:] or [camera_frame], axis=0)
+                    background = LiveBackground(np.median(stack, axis=0).astype(np.uint8))
+                    samples.clear()
+                    calibrating = False
+                    cover = None
+                    effect.reset()
+                    vanish_hold.block(now, 0.5)
+                    appear_hold.block(now, 0.5)
+                    say(f"Ready. Step back in and show {VANISH_POSE[mode]} to vanish.")
                 display = camera_frame
-
-            elif background is None:
-                state.phase = "calibrating"
-                state.calibration_started = now
-                display = camera_frame
-
-            elif state.phase == "vanished":
-                if vanished_frame is None:
-                    vanished_frame = background.copy()
-                    if mode == "naruto" and log_anchor is not None:
-                        overlay_log(vanished_frame, log_sprite, landed_log_anchor(log_anchor, height),
-                                    cache=log_cache)
-                display = vanished_frame
-
             else:
-                mask = last_mask
-                if (
-                    state.phase == "ready"
-                    and now - state.last_gesture_check >=
-                    (0.08 if mode == "naruto" else GESTURE_INTERVAL_SECONDS)
-                ):
-                    state.last_gesture_check = now
-                    rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                    if mode == "normal":
-                        name, score = recognize_gesture(recognizer, mp_image, elapsed_ms)
-                        if args.gesture_debug and now - last_gesture_report >= 1.0:
-                            print(
-                                f"[Gesture] {name}, score={score:.2f}, "
-                                f"crop={recognizer.preferred_crop or 'full'}, "
-                                f"rotation={recognizer.preferred_rotation or 0}"
-                            )
-                            last_gesture_report = now
-                        if start_vanish_on_gesture(state, name, score, now):
-                            say("Gesture seen: vanishing. Press Reappear to come back.")
+                rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                cover = cover_mask(person_mask(segmenter, mp_image, timestamp, width, height), cover)
+                background.update(camera_frame, cover)
+
+                if effect.phase in ("visible", "vanished") and now - last_gesture_check >= gesture_interval:
+                    last_gesture_check = now
+                    if effect.phase == "visible":
+                        if mode == "normal":
+                            name, score = recognize_gesture(recognizer, mp_image, timestamp)
+                            seen = name == "Victory" and score >= VICTORY_MIN_SCORE
+                            detail = f"{name} score={score:.2f}"
+                        else:
+                            seen = recognizer.recognize_joined_hands(mp_image, timestamp)
+                            detail = f"hands={recognizer.last_hand_count} joined={seen}"
+                        if vanish_hold.update(seen, now):
+                            switch("vanish", now, cover)
                     else:
-                        joined = recognizer.recognize_joined_hands(mp_image, elapsed_ms)
-                        if args.gesture_debug and now - last_gesture_report >= 1.0:
-                            print(f"[Hands] detected={recognizer.last_hand_count}, "
-                                  f"joined={joined}, view={recognizer.preferred_view or 'full'}")
-                            last_gesture_report = now
-                        if start_naruto_on_join(state, joined, time.perf_counter()):
-                            vanish_sound.play()
-                            say("Gesture seen: vanishing. Press Reappear to come back.")
+                        seen = recognizer.detect_open_palm(mp_image, timestamp)
+                        detail = f"open_palm={seen}"
+                        if appear_hold.update(seen, now):
+                            switch("appear", now, cover)
+                    if args.gesture_debug and now - last_gesture_report >= 1.0:
+                        print(f"[Gesture] {detail}", flush=True)
+                        last_gesture_report = now
 
-                if state.phase in ("vanishing", "naruto_vanishing"):
-                    # Normal dissolve tracks the silhouette at 20 Hz; Naruto
-                    # needs it only while the person is still visible.
-                    needs_mask = (
-                        (mode == "normal" and (mask is None or now - last_mask_at >= 0.05))
-                        or (mode == "naruto" and (log_anchor is None or now - state.vanish_started < 0.13))
-                    )
-                    if needs_mask:
-                        if mp_image is None:
-                            rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                        mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
-                        last_mask = mask
-                        last_mask_at = now
-                    if mode == "naruto" and log_anchor is None:
-                        log_anchor = substitution_anchor(mask)
-
-                if mode == "naruto" and state.phase == "naruto_vanishing":
-                    age = max(0.04, time.perf_counter() - state.vanish_started)
-                    display = render_substitution(
-                        camera_frame, background, mask, log_sprite, log_anchor, age, log_cache
-                    )
-                    if age >= EFFECT_SECONDS:
-                        state.phase = "vanished"
-                        vanished_frame = display
-                elif state.phase == "ready":
-                    display = camera_frame
-                else:
-                    progress = 0.0
-                    if state.phase == "vanishing" and state.vanish_started is not None:
-                        progress = min(
-                            1.0, (time.perf_counter() - state.vanish_started) / VANISH_SECONDS
-                        )
-                        if progress >= 1.0:
-                            state.phase = "vanished"
-                    display = apply_dissolve(
-                        camera_frame, background, mask, progress, dissolve_field, sparkle_noise
-                    )
-                    if state.phase == "vanished":
-                        vanished_frame = display
+                plate = background.image if effect.phase != "visible" else camera_frame
+                display = effect.render(camera_frame, plate, cover, now)
 
             if virtual_camera is not None:
                 send_virtual_frame(virtual_camera, display)
@@ -914,40 +761,22 @@ def run_camera(
             if command == "quit":
                 break
             if command == "background":
-                state.phase = "calibrating"
-                state.calibration_started = now
-                state.vanish_started = None
-                log_anchor = None
-                last_mask = None
-                last_mask_at = float("-inf")
-                vanished_frame = None
-                background_samples.clear()
+                calibrating = True
+                calibration_started = now
                 calibration_remaining = None
+                samples.clear()
+                effect.reset()
                 say("Step out of the frame for 4 seconds: capturing a new background.")
-            elif command == "reappear":
-                if background is not None:
-                    state.phase = "ready"
-                    state.vanish_started = None
-                    vanished_frame = None
-                    log_anchor = None
-                    last_mask = None
-                    last_mask_at = float("-inf")
-                    say("Visible again. Make the gesture to vanish.")
-            elif command == "vanish" and background is not None:
-                state.phase = "naruto_vanishing" if mode == "naruto" else "vanishing"
-                state.vanish_started = time.perf_counter()
-                if mode == "naruto":
-                    vanish_sound.play()
-                    log_anchor = None
-                vanished_frame = None
-                say("Vanishing. Press Reappear to come back.")
+            elif command in ("vanish", "reappear") and not calibrating:
+                current = cover if cover is not None else np.zeros((height, width), np.float32)
+                switch("vanish" if command == "vanish" else "appear", now, current)
             elif command == "fullscreen" and preview:
-                state.fullscreen = not state.fullscreen
-                set_fullscreen(state.fullscreen)
+                fullscreen = not fullscreen
+                set_fullscreen(fullscreen)
             elif command == "preview":
                 preview = not preview
                 if preview:
-                    open_preview(args.width, args.height, state.fullscreen)
+                    open_preview(args.width, args.height, fullscreen)
                 else:
                     cv2.destroyWindow(WINDOW_NAME)
                     cv2.waitKey(1)

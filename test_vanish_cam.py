@@ -7,8 +7,7 @@ import mediapipe as mp
 
 import vanish_cam
 from vanish_cam import (
-    AppState, MultiViewGestureRecognizer, recognize_gesture, start_vanish_on_gesture,
-    victory_landmark_score,
+    MultiViewGestureRecognizer, recognize_gesture, victory_landmark_score,
 )
 
 
@@ -126,28 +125,6 @@ class VictoryGestureTests(unittest.TestCase):
             result = SimpleNamespace(hand_world_landmarks=hands, hand_landmarks=[], gestures=[])
             recognizer = SimpleNamespace(recognize_for_video=lambda image, timestamp: result)
             self.assertEqual(recognize_gesture(recognizer, None, 1000)[0], expected)
-
-
-class ImmediateAnimationTests(unittest.TestCase):
-    def test_first_recognized_v_starts_animation_immediately(self):
-        state = AppState(phase="ready")
-        self.assertTrue(start_vanish_on_gesture(state, "Victory", 0.9, 12.5))
-        self.assertEqual(state.phase, "vanishing")
-        self.assertEqual(state.vanish_started, 12.5)
-
-    def test_other_or_weak_gestures_do_not_vanish(self):
-        for name, score in (("No_Hand", 0.0), ("Hand_Detected", 0.0), ("Victory", 0.61)):
-            with self.subTest(name=name, score=score):
-                state = AppState(phase="ready")
-                self.assertFalse(start_vanish_on_gesture(state, name, score, 12.5))
-                self.assertEqual(state.phase, "ready")
-                self.assertIsNone(state.vanish_started)
-
-    def test_only_ready_phase_responds(self):
-        for phase in ("calibrating", "vanishing", "vanished"):
-            state = AppState(phase=phase)
-            self.assertFalse(start_vanish_on_gesture(state, "Victory", 0.9, 12.5))
-            self.assertEqual(state.phase, phase)
 
 
 class MultiViewTests(unittest.TestCase):
