@@ -5,7 +5,6 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 root = Path(SPECPATH).resolve().parent
 resources = [
-    (root / "hand_landmarker.task", "."),
     (root / "models" / "gesture_recognizer.task", "models"),
     (root / "models" / "selfie_segmenter_landscape.tflite", "models"),
     (root / "assets" / "vanish.MP3", "assets"),

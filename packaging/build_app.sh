@@ -11,7 +11,7 @@ fi
 .venv/bin/python -m pip install -q -r requirements.txt "pyinstaller>=6,<7"
 
 # Models are downloaded once and bundled, so the app works offline.
-.venv/bin/python -c "import vanish_cam; vanish_cam.download_models('normal')"
+.venv/bin/python -c "import vanish_cam; vanish_cam.download_models()"
 [ -f packaging/VanishCam.icns ] || .venv/bin/python packaging/make_icon.py
 
 .venv/bin/python -m PyInstaller --noconfirm --clean \

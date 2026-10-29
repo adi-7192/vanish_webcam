@@ -33,14 +33,17 @@ from PyObjCTools import AppHelper
 import call_audio
 import vanish_cam
 
+# Each effect has its own vanish gesture; this list also sets the Vanish button.
 MODES = (
-    ("normal", "Dissolve  ✌️"),
-    ("dust", "Dust  ✌️"),
-    ("beam", "Teleport  ✌️"),
-    ("glitch", "Glitch  ✌️"),
-    ("portal", "Portal  ✌️"),
-    ("naruto", "Smoke puff  🙏"),
+    ("normal", "✌️ Dissolve"),
+    ("dust", "✊ Dust"),
+    ("portal", "☝️ Portal"),
+    ("glitch", "🤟 Glitch"),
+    ("beam", "👎 Teleport"),
+    ("naruto", "🙏 Smoke puff"),
 )
+CHEAT_SHEET = ("✌️ Dissolve   ✊ Dust   ☝️ Portal\n"
+               "🤟 Glitch   👎 Teleport   🙏 Smoke   ✋ back")
 MODE_IDS = [mode for mode, _ in MODES]
 CAMERAS = range(4)
 THUMBNAIL_FPS = 8
@@ -77,25 +80,26 @@ class Engine:
     def running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, mode: str, camera: int) -> None:
+    def start(self, camera: int, button_effect: str) -> None:
+        """Start a session: it runs until stop(), whatever effects are used."""
         self.stop()
         self.commands = queue.Queue()
         args = argparse.Namespace(
             camera=camera, width=960, height=540, fps=30.0, fullscreen=False,
             # Meet/WhatsApp mirror your self-view themselves; others must see you unmirrored.
-            no_mirror=True, virtual_camera=True, mode=mode, gesture_debug=False,
-            no_preview=True, control_stdin=False,
+            no_mirror=True, virtual_camera=True, button_effect=button_effect,
+            gesture_debug=False, no_preview=True, control_stdin=False,
         )
         self.thread = threading.Thread(
-            target=self._run, args=(args, mode, self.commands), name="vanish-engine", daemon=True
+            target=self._run, args=(args, self.commands), name="vanish-engine", daemon=True
         )
         self.thread.start()
 
-    def _run(self, args, mode, commands) -> None:
+    def _run(self, args, commands) -> None:
         error = None
         try:
             with ExitStack() as resources:
-                vanish_cam.run_camera(args, resources, mode, commands, self.on_frame)
+                vanish_cam.run_camera(args, resources, commands, self.on_frame)
         except Exception as exc:  # Shown to the user in the panel.
             error = str(exc)
         self.on_stopped(threading.current_thread(), error)
@@ -124,6 +128,7 @@ class Controller(NSObject):
             self.mode = "normal"
         self.camera = int(defaults.integerForKey_("camera"))
         self.call_audio = None
+        self.gestures_on = True
         self.last_thumbnail = 0.0
         self.engine = Engine(self.frameReady, self.engineStopped)
         vanish_cam.STATUS_LISTENERS.append(
@@ -144,7 +149,7 @@ class Controller(NSObject):
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
                  | NSWindowStyleMaskHUDWindow | NSWindowStyleMaskNonactivatingPanel)
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 280, 436), style, NSBackingStoreBuffered, False
+            NSMakeRect(0, 0, 280, 494), style, NSBackingStoreBuffered, False
         )
         panel.setTitle_("VanishCam")
         panel.setLevel_(NSFloatingWindowLevel)
@@ -160,34 +165,40 @@ class Controller(NSObject):
             panel.center()
         view = panel.contentView()
 
-        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 280, 260, 146))
+        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 338, 260, 146))
         self.preview.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         self.preview.setWantsLayer_(True)
         self.preview.layer().setCornerRadius_(8)
         self.preview.layer().setMasksToBounds_(True)
         view.addSubview_(self.preview)
         self.placeholder = NSTextField.labelWithString_("Camera off")
-        self.placeholder.setFrame_(NSMakeRect(10, 342, 260, 20))
+        self.placeholder.setFrame_(NSMakeRect(10, 400, 260, 20))
         self.placeholder.setAlignment_(1)  # NSTextAlignmentCenter
         self.placeholder.setTextColor_(NSColor.secondaryLabelColor())
         view.addSubview_(self.placeholder)
 
         self.status = NSTextField.wrappingLabelWithString_("")
-        self.status.setFrame_(NSMakeRect(10, 228, 260, 46))
+        self.status.setFrame_(NSMakeRect(10, 286, 260, 46))
         self.status.setFont_(NSFont.systemFontOfSize_(11))
         view.addSubview_(self.status)
 
-        self.effect_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(10, 190, 260, 30), False)
-        self.effect_menu.addItemsWithTitles_([f"Effect: {label}" for _, label in MODES])
+        self.effect_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(10, 210, 260, 30), False)
+        self.effect_menu.addItemsWithTitles_([f"Vanish button: {label}" for _, label in MODES])
         self.effect_menu.setTarget_(self)
         self.effect_menu.setAction_("modeChanged:")
         view.addSubview_(self.effect_menu)
 
-        self.start_button = self.button("Start", "toggleEngine:", (10, 150, 260, 34))
-        self.vanish_button = self.button("Vanish", "vanish:", (10, 110, 126, 34))
-        self.reappear_button = self.button("Reappear", "reappear:", (144, 110, 126, 34))
-        self.background_button = self.button("New background", "background:", (10, 74, 260, 30))
-        self.setup_button = self.button("Camera setup help", "openSetup:", (10, 40, 260, 28))
+        self.cheat_sheet = NSTextField.wrappingLabelWithString_(CHEAT_SHEET)
+        self.cheat_sheet.setFrame_(NSMakeRect(10, 246, 260, 34))
+        self.cheat_sheet.setFont_(NSFont.systemFontOfSize_(11))
+        self.cheat_sheet.setTextColor_(NSColor.secondaryLabelColor())
+        view.addSubview_(self.cheat_sheet)
+
+        self.start_button = self.button("Start", "toggleEngine:", (10, 170, 260, 34))
+        self.vanish_button = self.button("Vanish", "vanish:", (10, 130, 126, 34))
+        self.reappear_button = self.button("Reappear", "reappear:", (144, 130, 126, 34))
+        self.background_button = self.button("New background", "background:", (10, 94, 260, 30))
+        self.setup_button = self.button("Camera setup help", "openSetup:", (10, 60, 260, 28))
         for control in (self.start_button, self.vanish_button, self.reappear_button,
                         self.background_button, self.setup_button):
             view.addSubview_(control)
@@ -196,6 +207,10 @@ class Controller(NSObject):
             "Sound into call (mic: BlackHole 2ch)", self, "toggleCallAudio:")
         self.call_checkbox.setFrame_(NSMakeRect(12, 10, 258, 22))
         view.addSubview_(self.call_checkbox)
+        self.gestures_checkbox = NSButton.checkboxWithTitle_target_action_(
+            "Gestures on", self, "toggleGestures:")
+        self.gestures_checkbox.setFrame_(NSMakeRect(12, 34, 258, 22))
+        view.addSubview_(self.gestures_checkbox)
         self.panel = panel
         panel.orderFrontRegardless()
 
@@ -215,6 +230,7 @@ class Controller(NSObject):
         self.menuItem(menu, "Reappear", "reappear:", "r")
         self.menuItem(menu, "New background", "background:", "b")
         self.menu_call = self.menuItem(menu, "Sound into call", "toggleCallAudio:")
+        self.menu_pause = self.menuItem(menu, "Pause gestures", "toggleGestures:")
         menu.addItem_(NSMenuItem.separatorItem())
         effects = NSMenu.alloc().init()
         self.mode_items = {}
@@ -222,7 +238,7 @@ class Controller(NSObject):
             item = self.menuItem(effects, label, "pickMode:")
             item.setRepresentedObject_(mode)
             self.mode_items[mode] = item
-        effect_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Effect", None, "")
+        effect_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Vanish button effect", None, "")
         effect_item.setSubmenu_(effects)
         menu.addItem_(effect_item)
         webcam = NSMenu.alloc().init()
@@ -272,6 +288,8 @@ class Controller(NSObject):
         sending = self.call_audio is not None
         self.call_checkbox.setState_(1 if sending else 0)
         self.menu_call.setState_(1 if sending else 0)
+        self.gestures_checkbox.setState_(1 if self.gestures_on else 0)
+        self.menu_pause.setState_(0 if self.gestures_on else 1)
 
     def setStatus_(self, message) -> None:
         self.status.setStringValue_(message)
@@ -286,8 +304,8 @@ class Controller(NSObject):
             self.setStatus_("Approve 'OBS Virtual Camera' in System Settings (Camera "
                             "Extensions). Click 'Camera setup help'.")
         else:
-            self.setStatus_("Press Start, then pick 'OBS Virtual Camera' as the camera in "
-                            "Meet, Zoom or WhatsApp Web (in Chrome).")
+            self.setStatus_("Press Start once per session, then pick 'OBS Virtual Camera' as "
+                            "the camera in Meet, Zoom or WhatsApp Web (in Chrome).")
 
     @objc.python_method
     def savePreferences(self) -> None:
@@ -331,21 +349,23 @@ class Controller(NSObject):
     @objc.python_method
     def startEngine(self) -> None:
         self.setStatus_("Starting… loading the models.")
-        self.engine.start(self.mode, self.camera)
+        self.engine.start(self.camera, self.mode)
+        if not self.gestures_on:
+            self.engine.send("gestures:off")
         self.refresh()
 
     @objc.IBAction
     def toggleEngine_(self, sender) -> None:
         if self.engine.running:
             self.engine.stop()
-            self.setStatus_("Stopped. The virtual camera shows the OBS placeholder.")
+            self.setStatus_("Session stopped. The virtual camera shows the OBS placeholder.")
             self.refresh()
         else:
             self.startEngine()
 
     @objc.IBAction
     def vanish_(self, sender) -> None:
-        self.engine.send("vanish")
+        self.engine.send(f"vanish:{self.mode}")
 
     @objc.IBAction
     def reappear_(self, sender) -> None:
@@ -357,12 +377,9 @@ class Controller(NSObject):
 
     @objc.python_method
     def changeMode(self, mode: str) -> None:
-        if mode == self.mode:
-            return
+        """Only sets the Vanish button's effect; the session keeps running."""
         self.mode = mode
         self.savePreferences()
-        if self.engine.running:
-            self.startEngine()
         self.refresh()
 
     @objc.IBAction
@@ -375,10 +392,17 @@ class Controller(NSObject):
 
     @objc.IBAction
     def pickCamera_(self, sender) -> None:
+        if sender.tag() == self.camera:
+            return
         self.camera = sender.tag()
         self.savePreferences()
-        if self.engine.running:
-            self.startEngine()
+        self.engine.send(f"camera:{self.camera}")  # same session, new view
+        self.refresh()
+
+    @objc.IBAction
+    def toggleGestures_(self, sender) -> None:
+        self.gestures_on = not self.gestures_on
+        self.engine.send(f"gestures:{'on' if self.gestures_on else 'off'}")
         self.refresh()
 
     @objc.IBAction

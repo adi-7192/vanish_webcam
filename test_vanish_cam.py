@@ -7,8 +7,13 @@ import mediapipe as mp
 
 import vanish_cam
 from vanish_cam import (
-    MultiViewGestureRecognizer, recognize_gesture, victory_landmark_score,
+    MultiViewGestureRecognizer, classify_gesture_result, classify_pose, victory_landmark_score,
 )
+
+
+def recognize_gesture(recognizer, image, timestamp_ms):
+    """V-sign check on a single VIDEO-mode result (the Victory part of classify_pose)."""
+    return classify_gesture_result(recognizer.recognize_for_video(image, timestamp_ms), image)
 
 
 def hand_points(extended=(True, True, False, False)):
@@ -130,13 +135,15 @@ class VictoryGestureTests(unittest.TestCase):
 class MultiViewTests(unittest.TestCase):
     def setUp(self):
         self.empty = SimpleNamespace(hand_world_landmarks=[], hand_landmarks=[], gestures=[])
-        self.victory = SimpleNamespace(
-            hand_world_landmarks=[], hand_landmarks=[],
-            gestures=[[SimpleNamespace(category_name="Victory", score=0.9)]],
-        )
+        self.victory = self.canned("Victory", 0.9)
         self.image = mp.Image(
             image_format=mp.ImageFormat.SRGB, data=np.zeros((100, 100, 3), dtype=np.uint8)
         )
+
+    @staticmethod
+    def canned(name, score):
+        return SimpleNamespace(hand_world_landmarks=[], hand_landmarks=[],
+                               gestures=[[SimpleNamespace(category_name=name, score=score)]])
 
     def detector(self, recognize):
         return MultiViewGestureRecognizer(
@@ -144,13 +151,13 @@ class MultiViewTests(unittest.TestCase):
             SimpleNamespace(recognize=recognize),
         )
 
-    def test_primary_victory_avoids_extra_inference(self):
+    def test_primary_pose_avoids_extra_inference(self):
         calls = []
         detector = MultiViewGestureRecognizer(
             SimpleNamespace(recognize_for_video=lambda image, timestamp: self.victory),
             SimpleNamespace(recognize=lambda image: calls.append(image) or self.empty),
         )
-        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "Victory")
+        self.assertEqual(detector.recognize_pose(self.image, 1000), "Victory")
         self.assertEqual(calls, [])
 
     def test_zoomed_tile_finds_a_small_hand_and_is_preferred_next_time(self):
@@ -159,24 +166,24 @@ class MultiViewTests(unittest.TestCase):
         def recognize(image):
             calls.append((image.width, image.height))
             # Only the 60x60 zoomed tiles "see" the hand.
-            return self.victory if image.width == 60 else self.empty
+            return self.canned("Closed_Fist", 0.8) if image.width == 60 else self.empty
 
         detector = self.detector(recognize)
-        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "Victory")
+        self.assertEqual(detector.recognize_pose(self.image, 1000), "Closed_Fist")
         self.assertEqual(calls, [(60, 60)])
         self.assertEqual(detector.preferred_view, ("tile00", 0))
         calls.clear()
-        self.assertEqual(recognize_gesture(detector, self.image, 1100)[0], "Victory")
+        self.assertEqual(detector.recognize_pose(self.image, 1100), "Closed_Fist")
         self.assertEqual(calls[0], (60, 60))
 
     def test_failed_search_is_spread_over_checks_and_throttled(self):
         calls = []
         detector = self.detector(lambda image: calls.append(image) or self.empty)
-        self.assertEqual(recognize_gesture(detector, self.image, 1000)[0], "No_Hand")
+        self.assertIsNone(detector.recognize_pose(self.image, 1000))
         self.assertEqual(len(calls), 3)
-        recognize_gesture(detector, self.image, 1040)  # within the retry interval
+        detector.recognize_pose(self.image, 1040)  # within the retry interval
         self.assertEqual(len(calls), 3)
-        recognize_gesture(detector, self.image, 1100)
+        detector.recognize_pose(self.image, 1100)
         self.assertEqual(len(calls), 6)
 
     def test_rotated_full_view_is_tried_after_the_tiles(self):
@@ -184,7 +191,7 @@ class MultiViewTests(unittest.TestCase):
             return self.victory if (image.width, image.height) == (100, 100) else self.empty
 
         detector = self.detector(recognize)
-        found = [recognize_gesture(detector, self.image, 1000 + step * 100)[0] for step in range(3)]
+        found = [detector.recognize_pose(self.image, 1000 + step * 100) for step in range(3)]
         self.assertEqual(found[-1], "Victory")
         self.assertEqual(detector.preferred_view, ("full", 1))
 
@@ -203,38 +210,82 @@ class MultiViewTests(unittest.TestCase):
         self.assertAlmostEqual(smoothed, 800 * 0.8 + 480 * 0.2)
 
 
+class ClassifyPoseTests(unittest.TestCase):
+    image = SimpleNamespace(width=640, height=480)
+
+    def result(self, name, score=0.9, hands=()):
+        return SimpleNamespace(hand_world_landmarks=[], hand_landmarks=list(hands),
+                               gestures=[[SimpleNamespace(category_name=name, score=score)]])
+
+    def test_each_vanish_gesture_maps_to_its_effect(self):
+        from effects import GESTURE_EFFECTS
+        for pose in ("Victory", "Closed_Fist", "Pointing_Up", "ILoveYou", "Thumb_Down"):
+            with self.subTest(pose=pose):
+                found = classify_pose(self.result(pose), self.image)
+                self.assertEqual(found, pose)
+                self.assertIn(found, GESTURE_EFFECTS)
+
+    def test_open_palm_label_is_the_reappear_pose(self):
+        self.assertEqual(classify_pose(self.result("Open_Palm"), self.image), "Open_Palm")
+
+    def test_thumbs_up_weak_scores_and_none_are_ignored(self):
+        for name, score in (("Thumb_Up", 0.95), ("Closed_Fist", 0.4), ("None", 0.9)):
+            with self.subTest(name=name):
+                self.assertIsNone(classify_pose(self.result(name, score), self.image))
+
+    def test_palms_together_win_over_any_label(self):
+        from test_hands import pressed_hand
+        result = self.result("Open_Palm", hands=[pressed_hand(0.45), pressed_hand(0.55)])
+        self.assertEqual(classify_pose(result, self.image), "Joined")
+
+
+class CommandTests(unittest.TestCase):
+    def test_valid_commands(self):
+        for text, expected in (("Vanish", "vanish"), ("vanish:dust", "vanish:dust"),
+                               ("camera:1", "camera:1"), ("gestures:off", "gestures:off"),
+                               (" reappear ", "reappear")):
+            self.assertEqual(vanish_cam.parse_command(text), expected)
+
+    def test_invalid_commands(self):
+        for text in ("vanish:fireball", "camera:x", "gestures:maybe", "dance", ""):
+            self.assertIsNone(vanish_cam.parse_command(text))
+
+
 class GestureModelOptionsTests(unittest.TestCase):
     def test_no_gesture_allowlist_so_all_hands_keep_their_landmarks(self):
         created = []
         fake = SimpleNamespace(create_from_options=lambda options: created.append(options) or SimpleNamespace(close=lambda: None))
         with patch.object(vanish_cam.vision, "GestureRecognizer", fake), \
                 patch.object(vanish_cam.vision.ImageSegmenter, "create_from_options"):
-            vanish_cam.create_tasks("normal")
+            vanish_cam.create_tasks()
         options = created[0]
+        self.assertEqual(options.num_hands, 2)  # palms together needs both hands
         classifier = getattr(options, "canned_gesture_classifier_options", None)
         self.assertIsNone(getattr(classifier, "category_allowlist", None))
 
 
 class GestureWorkerTests(unittest.TestCase):
     def wait(self, worker):
+        import time
         for _ in range(200):
             result = worker.poll()
             if result is not None:
                 return result
-            import time; time.sleep(0.01)
+            time.sleep(0.01)
         self.fail("no gesture result")
 
     def test_one_check_in_flight_and_results_carry_phase_and_time(self):
         import threading
         release = threading.Event()
-        recognizer = SimpleNamespace(detect_open_palm=lambda image, ts: release.wait(2) and True)
-        worker = vanish_cam.GestureWorker(recognizer, "naruto")
+        recognizer = SimpleNamespace(recognize_pose=lambda image, ts: release.wait(2) and "Open_Palm",
+                                     last_hand_count=1)
+        worker = vanish_cam.GestureWorker(recognizer)
         try:
             self.assertTrue(worker.submit("vanished", None, 10, 1.5))
             self.assertFalse(worker.submit("vanished", None, 20, 1.6))  # still busy
             self.assertIsNone(worker.poll())  # never blocks the video loop
             release.set()
-            self.assertEqual(self.wait(worker), ("vanished", 1.5, True, "open_palm=True"))
+            self.assertEqual(self.wait(worker), ("vanished", 1.5, "Open_Palm", "pose=Open_Palm hands=1"))
             self.assertTrue(worker.submit("vanished", None, 30, 1.7))
         finally:
             release.set()
@@ -243,12 +294,11 @@ class GestureWorkerTests(unittest.TestCase):
     def test_failed_check_does_not_kill_the_worker(self):
         def boom(image, ts):
             raise RuntimeError("model hiccup")
-        recognizer = SimpleNamespace(recognize_joined_hands=boom, last_hand_count=0)
-        worker = vanish_cam.GestureWorker(recognizer, "naruto")
+        worker = vanish_cam.GestureWorker(SimpleNamespace(recognize_pose=boom, last_hand_count=0))
         try:
             worker.submit("visible", None, 10, 1.0)
-            phase, _, seen, detail = self.wait(worker)
-            self.assertFalse(seen)
+            phase, _, pose, detail = self.wait(worker)
+            self.assertIsNone(pose)
             self.assertIn("model hiccup", detail)
             self.assertTrue(worker.thread.is_alive())
         finally:
@@ -256,26 +306,12 @@ class GestureWorkerTests(unittest.TestCase):
         self.assertFalse(worker.thread.is_alive())
 
 
-class EffectModesTests(unittest.TestCase):
-    def test_every_mode_has_both_sounds(self):
+class EffectSoundsTests(unittest.TestCase):
+    def test_every_effect_has_both_sounds(self):
         from vanish_sound import sound_paths
-        for mode in vanish_cam.MODES:
-            for path in sound_paths(mode).values():
+        for style in vanish_cam.STYLES:
+            for path in sound_paths(style).values():
                 self.assertTrue(path.is_file(), path)
-
-    def test_only_naruto_uses_palms_together(self):
-        self.assertIn("palms", vanish_cam.vanish_pose("naruto"))
-        for mode in ("normal", "dust", "beam", "glitch", "portal"):
-            self.assertIn("V sign", vanish_cam.vanish_pose(mode))
-
-    def test_new_modes_use_the_v_sign_check(self):
-        recognizer = SimpleNamespace()
-        worker = vanish_cam.GestureWorker(recognizer, "portal")
-        try:
-            with patch.object(vanish_cam, "recognize_gesture", return_value=("Victory", 0.9)):
-                self.assertEqual(worker.check("visible", None, 10), (True, "Victory score=0.90"))
-        finally:
-            worker.close()
 
 
 class HandModelImageTests(unittest.TestCase):
@@ -296,7 +332,7 @@ class HandModelImageTests(unittest.TestCase):
 
     def test_macos_uses_gpu_delegate(self):
         with patch.object(vanish_cam.platform, "system", return_value="Darwin"):
-            options = vanish_cam.hand_base_options(vanish_cam.HAND_MODEL)
+            options = vanish_cam.hand_base_options(vanish_cam.GESTURE_MODEL)
         self.assertEqual(options.delegate, vanish_cam.python.BaseOptions.Delegate.GPU)
 
 

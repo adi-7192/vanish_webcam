@@ -17,7 +17,7 @@ REFORM_SECONDS = 1.6        # Normal: open palm -> dissolve back in.
 SMOKE_SECONDS = 1.45        # Naruto: length of the smoke puff.
 SMOKE_SWAP_SECONDS = 0.13   # Naruto: person swaps while the smoke is densest.
 BACKGROUND_LEARN_RATE = 0.04
-GESTURE_HOLD_SECONDS = 0.35
+GESTURE_HOLD_SECONDS = 0.45
 GESTURE_GAP_SECONDS = 0.45  # small hands blink in and out of detection
 GESTURE_COOLDOWN_SECONDS = 1.2
 FINGER_BASES = (5, 9, 13, 17)  # MCP landmark of index, middle, ring and little finger.
@@ -85,35 +85,48 @@ def open_palm_from_landmarks(hands, width: int, height: int) -> bool:
 
 # ---- Gesture timing ---------------------------------------------------------
 
-class GestureHold:
-    """Fire once a pose has been held for ``hold`` seconds, with a cooldown.
+# Vanish gesture -> effect style. An open palm always brings you back.
+GESTURE_EFFECTS = {
+    "Victory": "normal",      # ✌️ Dissolve
+    "Joined": "naruto",       # 🙏 Smoke puff
+    "Closed_Fist": "dust",    # ✊ Dust
+    "Pointing_Up": "portal",  # ☝️ Portal
+    "ILoveYou": "glitch",     # 🤟 Glitch
+    "Thumb_Down": "beam",     # 👎 Teleport
+}
+REAPPEAR_POSE = "Open_Palm"   # ✋
 
-    Short detection gaps (up to ``gap`` seconds) do not reset the hold, so a
-    single missed frame does not cancel the gesture.
+
+class PoseHold:
+    """Fire once the same pose has been held for ``hold`` seconds.
+
+    Short detection gaps (up to ``gap`` seconds) do not reset the hold, a
+    different pose restarts it, and ``block`` adds a cooldown after a switch.
     """
 
     def __init__(self, hold: float = GESTURE_HOLD_SECONDS, gap: float = GESTURE_GAP_SECONDS):
         self.hold = hold
         self.gap = gap
-        self.since: float | None = None
+        self.pose: str | None = None
+        self.since = 0.0
         self.last_seen = -math.inf
         self.blocked_until = -math.inf
 
-    def update(self, seen: bool, now: float) -> bool:
+    def update(self, pose: str | None, now: float) -> str | None:
         if now - self.last_seen > self.gap:
-            self.since = None
-        if not seen:
-            return False
-        if self.since is None:
-            self.since = now
+            self.pose = None
+        if pose is None:
+            return None
+        if pose != self.pose:
+            self.pose, self.since = pose, now
         self.last_seen = now
         if now >= self.blocked_until and now - self.since >= self.hold:
-            self.since = None
-            return True
-        return False
+            self.pose = None
+            return pose
+        return None
 
     def block(self, now: float, seconds: float = GESTURE_COOLDOWN_SECONDS) -> None:
-        self.since = None
+        self.pose = None
         self.blocked_until = now + seconds
 
 
@@ -596,15 +609,20 @@ STYLES = {
 class VanishEffect:
     """visible -> vanishing -> vanished -> appearing -> visible."""
 
-    def __init__(self, style: str):
+    def __init__(self, style: str = "normal"):
+        self.styles = {name: make() for name, make in STYLES.items()}
         self.style_name = style
-        self.style = STYLES[style]()
+        self.style = self.styles[style]
         self.phase = "visible"
         self.started = 0.0
 
-    def vanish(self, now: float, cover: np.ndarray, frame: np.ndarray | None = None) -> bool:
+    def vanish(self, now: float, cover: np.ndarray, frame: np.ndarray | None = None,
+               style: str | None = None) -> bool:
+        """Start vanishing with ``style`` (default: the last one used)."""
         if self.phase != "visible":
             return False
+        if style is not None:
+            self.style_name, self.style = style, self.styles[style]
         self.phase, self.started = "vanishing", now
         self.style.begin(frame, cover, appearing=False)
         return True

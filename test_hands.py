@@ -1,7 +1,6 @@
 import unittest
-from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -53,33 +52,28 @@ class JoinedHandsTests(unittest.TestCase):
                    for hand in hands]
         self.assertTrue(joined_hands_from_landmarks(rotated, 480, 640))
 
-    def test_recognizer_uses_two_hands_in_the_current_frame(self):
+    def test_recognizer_reports_joined_hands_from_the_current_frame(self):
         primary, alternate = Mock(), Mock()
-        primary.detect_for_video.return_value = SimpleNamespace(
-            hand_landmarks=[pressed_hand(0.45), pressed_hand(0.55)])
-        recognizer = app.MultiViewHandLandmarker(primary, alternate)
-        self.assertTrue(recognizer.recognize_joined_hands(image(), 100))
+        primary.recognize_for_video.return_value = SimpleNamespace(
+            hand_landmarks=[pressed_hand(0.45), pressed_hand(0.55)], hand_world_landmarks=[], gestures=[])
+        recognizer = app.MultiViewGestureRecognizer(primary, alternate)
+        self.assertEqual(recognizer.recognize_pose(image(), 100), "Joined")
         self.assertEqual(recognizer.last_hand_count, 2)
-        alternate.detect.assert_not_called()
+        alternate.recognize.assert_not_called()
 
-    def test_hand_model_recovers_joined_hands_in_a_zoomed_view(self):
+    def test_joined_hands_recovered_in_a_zoomed_view(self):
         primary, alternate = Mock(), Mock()
-        primary.detect_for_video.return_value = SimpleNamespace(hand_landmarks=[pressed_hand(0.45)])
-        alternate.detect.side_effect = [
-            SimpleNamespace(hand_landmarks=[]),
-            SimpleNamespace(hand_landmarks=[pressed_hand(0.45), pressed_hand(0.55)]),
+        primary.recognize_for_video.return_value = SimpleNamespace(
+            hand_landmarks=[pressed_hand(0.45)], hand_world_landmarks=[], gestures=[])
+        alternate.recognize.side_effect = [
+            SimpleNamespace(hand_landmarks=[], hand_world_landmarks=[], gestures=[]),
+            SimpleNamespace(hand_landmarks=[pressed_hand(0.45), pressed_hand(0.55)],
+                            hand_world_landmarks=[], gestures=[]),
         ]
-        recognizer = app.MultiViewHandLandmarker(primary, alternate)
-        self.assertTrue(recognizer.recognize_joined_hands(image(), 100))
+        recognizer = app.MultiViewGestureRecognizer(primary, alternate)
+        self.assertEqual(recognizer.recognize_pose(image(), 100), "Joined")
         self.assertEqual(recognizer.preferred_view, ("tile01", 0))
         self.assertEqual(recognizer.last_hand_count, 2)
-
-    def test_open_palm_falls_back_to_zoomed_views(self):
-        primary, alternate = Mock(), Mock()
-        primary.detect_for_video.return_value = SimpleNamespace(hand_landmarks=[])
-        alternate.detect.return_value = SimpleNamespace(hand_landmarks=[open_hand()])
-        recognizer = app.MultiViewHandLandmarker(primary, alternate)
-        self.assertTrue(recognizer.detect_open_palm(image(), 100))
 
 
 class OpenPalmTests(unittest.TestCase):
@@ -96,29 +90,17 @@ class OpenPalmTests(unittest.TestCase):
         hands = [pressed_hand(0.45), pressed_hand(0.55)]
         self.assertFalse(open_palm_from_landmarks(hands, 640, 480))
 
-    def test_both_recognizers_detect_open_palm_with_primary_model_only(self):
-        landmarker = app.MultiViewHandLandmarker(Mock(), Mock())
-        landmarker.primary.detect_for_video.return_value = SimpleNamespace(hand_landmarks=[open_hand()])
-        self.assertTrue(landmarker.detect_open_palm(image(), 100))
-        gestures = app.MultiViewGestureRecognizer(Mock(), Mock())
-        gestures.primary.recognize_for_video.return_value = SimpleNamespace(hand_landmarks=[open_hand()])
-        self.assertTrue(gestures.detect_open_palm(image(), 100))
-        landmarker.alternate.detect.assert_not_called()
-        gestures.alternate.recognize.assert_not_called()
-
-
-class MenuTests(unittest.TestCase):
-    def test_keyboard_selection(self):
-        with ExitStack() as mocks:
-            mocks.enter_context(patch.object(app.cv2, "namedWindow"))
-            mocks.enter_context(patch.object(app.cv2, "setMouseCallback"))
-            mocks.enter_context(patch.object(app.cv2, "imshow"))
-            mocks.enter_context(patch.object(app.cv2, "destroyWindow"))
-            mocks.enter_context(patch.object(app.cv2, "getWindowProperty", return_value=1))
-            key = mocks.enter_context(patch.object(app.cv2, "waitKey", return_value=ord("2")))
-            self.assertEqual(app.choose_mode(), "naruto")
-            key.return_value = ord("1")
-            self.assertEqual(app.choose_mode(), "normal")
+    def test_open_palm_found_by_the_tracker_or_a_zoomed_view(self):
+        empty = SimpleNamespace(hand_landmarks=[], hand_world_landmarks=[], gestures=[])
+        palm = SimpleNamespace(hand_landmarks=[open_hand()], hand_world_landmarks=[], gestures=[])
+        direct = app.MultiViewGestureRecognizer(Mock(), Mock())
+        direct.primary.recognize_for_video.return_value = palm
+        self.assertEqual(direct.recognize_pose(image(), 100), "Open_Palm")
+        direct.alternate.recognize.assert_not_called()
+        zoomed = app.MultiViewGestureRecognizer(Mock(), Mock())
+        zoomed.primary.recognize_for_video.return_value = empty
+        zoomed.alternate.recognize.return_value = palm
+        self.assertEqual(zoomed.recognize_pose(image(), 100), "Open_Palm")
 
 
 if __name__ == "__main__":

@@ -19,30 +19,29 @@ VanishCam reads your real webcam, adds the effect, and sends the result to the *
 
 ## Using it in a call
 
-1. Open **VanishCam**. The floating panel and the menu-bar icon appear.
-2. Pick **Normal** or **Naruto**, then press **Start**.
-3. Step out of the frame for 4 seconds while the background is captured. The panel tells you when to step back in.
-4. In Meet, Zoom or WhatsApp Web, choose **OBS Virtual Camera** as your camera. Each app remembers this. While no effect is running, it shows your normal webcam, so you can leave it selected.
-5. Make the vanish gesture, or press **Vanish**. Show an open palm ✋, or press **Reappear**, to come back.
+1. Open **VanishCam** and press **Start**. That starts a session.
+2. Step out of the frame for 4 seconds while the empty room is captured. This happens once per session.
+3. In Meet, Zoom or WhatsApp Web, choose **OBS Virtual Camera** as your camera. Each app remembers this. While you are visible it shows your normal webcam, so you can leave it selected.
+4. From now on, just use gestures. Each vanish gesture plays its own effect, and an open palm ✋ brings you back with the same effect in reverse. No menus, no new captures.
+5. Press **Stop** when you are done. Nothing else ends the session: changing the Vanish button's effect or the webcam keeps it running, and the camera stays live in every call app.
 
 The panel floats above your call and never takes focus away from it. Close it any time and reopen it from the menu-bar icon, which has the same controls.
 
-### Effects and gestures
+### Gestures
 
-Pick an effect in the panel's **Effect** menu (or under **Effect** in the menu-bar icon).
+| Gesture | Effect |
+|---|---|
+| ✌️ V sign | **Dissolve**: you dissolve away with a glowing edge |
+| ✊ Fist | **Dust**: you crumble into particles that blow away |
+| ☝️ Point up | **Portal**: a glowing ring opens and you spiral into it |
+| 🤟 Rock / I-love-you | **Glitch**: you break into slices and split colours, then flicker out |
+| 👎 Thumbs down | **Teleport**: a shimmering column of light beams you out |
+| 🙏 Palms together, fingers side by side | **Smoke puff**: you vanish in a puff of smoke |
+| ✋ Open palm | **Come back**, reversing whichever effect you vanished with |
 
-| Effect | Vanish | Reappear |
-|---|---|---|
-| **Dissolve** | ✌️ V sign: you dissolve away with a glowing edge | ✋ open palm: you dissolve back in |
-| **Dust** | ✌️ V sign: you crumble into particles that blow away | ✋ open palm: the dust flies back together |
-| **Teleport** | ✌️ V sign: a shimmering column of light beams you out | ✋ open palm: you beam back in |
-| **Glitch** | ✌️ V sign: you break into slices and split colours, then flicker out | ✋ open palm: you glitch back in |
-| **Portal** | ✌️ V sign: a glowing ring opens and you spiral into it | ✋ open palm: you spiral back out |
-| **Smoke puff** | 🙏 palms together, fingers side by side: you vanish in a puff of smoke | ✋ open palm: you reappear inside the smoke |
+👍 is deliberately not used, because people use it all the time in calls. Hold a gesture for about half a second; quick, accidental hand shapes do nothing, and there is a short pause after each switch. Untick **Gestures on** (or choose **Pause gestures** in the menu bar) when you want to talk with your hands; the **Vanish** and **Reappear** buttons keep working, and the **Vanish button** menu chooses the effect they use.
 
-Each effect has its own sound, played forwards when you vanish and backwards when you come back. The sounds are generated in code (`packaging/make_sounds.py`); the smoke puff uses the original `assets/vanish.MP3`.
-
-Hold a gesture for about a third of a second. A quick, accidental hand shape does not trigger anything, and there is a short pause after each switch. Sounds play on your speakers, and can also go into the call (see below).
+Each effect has its own sound, played forwards when you vanish and backwards when you come back. The sounds are generated in code (`packaging/make_sounds.py`); the smoke puff uses the original `assets/vanish.MP3`. They play on your speakers, and can also go into the call (see below).
 
 While you are invisible, the rest of the room stays live: only the area where you are is filled in with the background, which keeps updating as the light changes.
 
@@ -50,7 +49,7 @@ While you are invisible, the rest of the room stays live: only the area where yo
 
 - Capture the background with good, steady light. If you move the camera or furniture, press **New background**.
 - Other people who walk into the frame while you are invisible are hidden too.
-- If the thumbnail shows the wrong camera, choose another under **Webcam** in the menu-bar icon.
+- If the thumbnail shows the wrong camera, choose another under **Webcam** in the menu-bar icon. The session keeps running; you step out once more so the new view's background can be captured.
 - **WhatsApp:** use WhatsApp Web in Chrome (web.whatsapp.com), which supports video calls. The WhatsApp desktop app freezes on the OBS camera because it only accepts the 420v pixel format, which OBS does not provide ([details](https://github.com/kortexa-ai/aicamera/issues/71)). Calls from your phone always use the phone's camera.
 - Your self-view in Meet looks mirrored, as usual. Other people see you the right way round.
 
@@ -85,7 +84,7 @@ python3.12 -m venv .venv
 .venv/bin/python -m unittest test_call_audio test_effects test_hands test_vanish_cam test_video_output
 ```
 
-`vanish_cam.py` preview keys: `SPACE` new background, `V` vanish, `R` reappear, `F` fullscreen, `Q` quit. Other options: `--mode normal|naruto`, `--camera N`, `--width`, `--height`, `--fps`, `--no-preview --control-stdin` (read commands from stdin) and `--gesture-debug`.
+`vanish_cam.py` preview keys: `SPACE` new background, `V` vanish, `R` reappear, `F` fullscreen, `Q` quit. Other options: `--button-effect normal|dust|portal|glitch|beam|naruto`, `--camera N`, `--width`, `--height`, `--fps`, `--no-preview --control-stdin` (read commands such as `vanish:dust`, `reappear`, `camera:1`, `gestures:off` from stdin) and `--gesture-debug`.
 
 ## Credits
 

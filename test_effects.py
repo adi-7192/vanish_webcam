@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 import effects
-from effects import GestureHold, LiveBackground, VanishEffect, cover_mask, replace_person
+from effects import LiveBackground, PoseHold, VanishEffect, cover_mask, replace_person
 
 H, W = 60, 80
 
@@ -18,25 +18,35 @@ def scene():
     return frame, background, mask
 
 
-class GestureHoldTests(unittest.TestCase):
+class PoseHoldTests(unittest.TestCase):
     def test_fires_only_after_hold_and_survives_short_gaps(self):
-        hold = GestureHold(hold=0.35, gap=0.3)
-        self.assertFalse(hold.update(True, 0.0))
-        self.assertFalse(hold.update(False, 0.14))  # one missed check
-        self.assertFalse(hold.update(True, 0.28))
-        self.assertTrue(hold.update(True, 0.42))
-        self.assertFalse(hold.update(True, 0.50))  # needs a fresh hold
+        hold = PoseHold(hold=0.45, gap=0.3)
+        self.assertIsNone(hold.update("Closed_Fist", 0.0))
+        self.assertIsNone(hold.update(None, 0.1))  # one missed check
+        self.assertIsNone(hold.update("Closed_Fist", 0.3))
+        self.assertEqual(hold.update("Closed_Fist", 0.5), "Closed_Fist")
+        self.assertIsNone(hold.update("Closed_Fist", 0.6))  # needs a fresh hold
+
+    def test_changing_pose_restarts_the_hold(self):
+        hold = PoseHold(hold=0.45, gap=0.3)
+        hold.update("Victory", 0.0)
+        hold.update("Victory", 0.2)
+        self.assertIsNone(hold.update("Pointing_Up", 0.4))  # different pose: start over
+        self.assertIsNone(hold.update("Pointing_Up", 0.6))
+        self.assertIsNone(hold.update("Pointing_Up", 0.75))
+        self.assertEqual(hold.update("Pointing_Up", 0.95), "Pointing_Up")
 
     def test_long_gap_resets_and_cooldown_blocks(self):
-        hold = GestureHold(hold=0.35, gap=0.3)
-        hold.update(True, 0.0)
-        self.assertFalse(hold.update(True, 0.5))  # gap 0.5 > 0.3 restarts the hold
-        self.assertFalse(hold.update(True, 0.7))
-        self.assertTrue(hold.update(True, 0.9))
+        hold = PoseHold(hold=0.45, gap=0.3)
+        hold.update("Victory", 0.0)
+        self.assertIsNone(hold.update("Victory", 0.5))  # gap 0.5 > 0.3 restarts the hold
+        self.assertIsNone(hold.update("Victory", 0.7))
+        self.assertIsNone(hold.update("Victory", 0.85))
+        self.assertEqual(hold.update("Victory", 1.0), "Victory")
         hold.block(1.0, seconds=1.2)
         for now in (1.1, 1.3, 1.5, 1.7, 1.9, 2.1):
-            self.assertFalse(hold.update(True, now))
-        self.assertTrue(hold.update(True, 2.3))
+            self.assertIsNone(hold.update("Victory", now))
+        self.assertEqual(hold.update("Victory", 2.3), "Victory")
 
 
 class BackgroundTests(unittest.TestCase):
@@ -127,6 +137,18 @@ class VanishEffectTests(unittest.TestCase):
         early = effect.render(frame, background, mask, 0.02)
         later = effect.render(frame, background, mask, effects.SMOKE_SWAP_SECONDS + 0.01)
         self.assertGreater(early[48, 40, 0], later[48, 40, 0] - 1)  # person fades as smoke grows
+
+    def test_each_vanish_picks_its_style_and_reappear_reverses_it(self):
+        frame, background, mask = scene()
+        effect = VanishEffect()
+        self.assertTrue(effect.vanish(0.0, mask, frame, style="dust"))
+        self.assertEqual(effect.style_name, "dust")
+        effect.render(frame, background, mask, 5.0)  # fully gone
+        self.assertTrue(effect.appear(6.0, mask, frame))
+        self.assertIs(effect.style, effect.styles["dust"])
+        effect.render(frame, background, mask, 20.0)  # back
+        self.assertTrue(effect.vanish(21.0, mask, frame, style="portal"))
+        self.assertEqual(effect.style_name, "portal")
 
     def test_reappear_can_interrupt_vanishing(self):
         frame, background, mask = scene()

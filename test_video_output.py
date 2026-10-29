@@ -14,7 +14,7 @@ def arguments(**overrides):
     values = dict(
         camera=0, width=960, height=540, fps=30.0, fullscreen=False,
         no_mirror=True, virtual_camera=None,
-        gesture_debug=False, mode="normal", no_preview=False, control_stdin=False,
+        gesture_debug=False, button_effect="normal", no_preview=False, control_stdin=False,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -100,34 +100,47 @@ class FitFrameTests(unittest.TestCase):
         self.assertTrue((out[:, 960] == 200).all())
 
 
+CALIBRATION_FRAMES = int(app.CALIBRATION_SECONDS * 30) + 2
+
+
 class VideoLoopTests(unittest.TestCase):
-    def run_loop(self, frames, mask, mode="normal", gestures=None, palms=None,
-                 remote=None, headless=False, send_error=None):
+    def run_loop(self, frames, mask, timeline=(), remote=None, headless=False,
+                 send_error=None, cameras=1):
+        """Run one session. ``timeline`` lists (start, end, pose) in seconds of
+        fake webcam time; ``remote`` lists commands, one per frame."""
         clock = [0.0]
-        capture = FakeCamera(frames, clock)
-        segmenter = Mock()
-        recognizer = Mock()
+        captures = [FakeCamera(frames, clock)]
+        for _ in range(cameras - 1):  # extra webcams continue the same footage
+            extra = FakeCamera([], clock)
+            extra.frames = captures[0].frames
+            captures.append(extra)
+        opened = []
+
+        def open_camera(index, width, height):
+            opened.append(index)
+            return captures[len(opened) - 1]
+
+        def recognize_pose(image, timestamp):
+            now = clock[0]
+            return next((pose for start, end, pose in timeline if start <= now < end), None)
+
+        segmenter, recognizer = Mock(), Mock()
         recognizer.last_hand_count = 0
-        gestures = list(gestures or [])
-        palms = list(palms or [])
-        recognizer.detect_open_palm.side_effect = lambda image, ts: palms.pop(0) if palms else False
-        recognizer.recognize_joined_hands.side_effect = lambda image, ts: gestures.pop(0) if gestures else False
-        victory = lambda *args: ("Victory", 0.9) if (gestures.pop(0) if gestures else False) else ("No_Hand", 0.0)
+        recognizer.recognize_pose.side_effect = recognize_pose
         camera = Mock(width=frames[0].shape[1], height=frames[0].shape[0])
-        camera.send.side_effect = send_error
-        remote = list(remote or [])
-        sent = []
+        sent, messages = [], []
         camera.send.side_effect = send_error or (lambda frame: sent.append(frame.copy()))
-        args = arguments(mode=mode, no_preview=headless, control_stdin=headless)
+        remote = list(remote or [])
+        args = arguments(no_preview=headless, control_stdin=headless)
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(app, "parse_args", return_value=args))
             mocks.enter_context(patch.object(app, "download_models"))
-            mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
+            mocks.enter_context(patch.object(app, "open_camera", side_effect=open_camera))
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(segmenter, recognizer)))
-            mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=camera))
+            opening = mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=camera))
             mocks.enter_context(patch.object(app, "EffectSound", return_value=Mock()))
             mocks.enter_context(patch.object(app, "person_mask", return_value=mask))
-            mocks.enter_context(patch.object(app, "recognize_gesture", side_effect=victory))
+            mocks.enter_context(patch.object(app, "say", side_effect=messages.append))
             mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=lambda: clock[0]))
             for name in ("namedWindow", "resizeWindow", "destroyAllWindows", "imshow"):
                 mocks.enter_context(patch.object(app.cv2, name))
@@ -144,52 +157,77 @@ class VideoLoopTests(unittest.TestCase):
             else:
                 with self.assertRaisesRegex(RuntimeError, "stopped sending"):
                     app.run()  # the fake webcam runs out of frames
-        capture.release.assert_called_once()
+        self.assertEqual(captures[len(opened) - 1].release.call_count, 1)
         segmenter.close.assert_called_once()
         recognizer.close.assert_called_once()
         camera.close.assert_called_once()
-        return sent, recognizer
+        opening.assert_called_once()  # the virtual camera stays open all session
+        return sent, messages, opened
 
-    def test_gesture_held_vanishes_and_open_palm_brings_you_back(self):
-        frames, room, mask = person_scene(260)
-        start = int(app.CALIBRATION_SECONDS * 30) + 2
-        # V sign on ~5 checks (0.7 s), then open palm on ~5 checks after vanishing.
-        gestures = [True] * 5
-        palms = [False] * 15 + [True] * 6
-        sent, recognizer = self.run_loop(frames, mask, gestures=gestures, palms=palms)
-        self.assertEqual(len(sent), len(frames))
-        np.testing.assert_array_equal(sent[start], frames[start])  # visible at first
-        vanished = [i for i, frame in enumerate(sent) if (frame[12, 20] == room[12, 20]).all()]
-        self.assertTrue(vanished, "person never vanished")
-        first_gone = vanished[0]
-        np.testing.assert_array_equal(sent[first_gone][:, :5], room[:, :5])  # room stays live
-        self.assertTrue(recognizer.detect_open_palm.called)
-        np.testing.assert_array_equal(sent[-1], frames[-1])  # back again at the end
-        self.assertGreater(len(sent) - 1, vanished[-1])
+    @staticmethod
+    def captures_of_empty_room(messages):
+        return [m for m in messages if m.startswith(("Step out", "Switched webcam"))]
 
-    def test_single_frame_gesture_does_not_trigger(self):
+    def test_one_session_different_gestures_one_background(self):
+        frames, room, mask = person_scene(720)
+        start = CALIBRATION_FRAMES / 30
+        timeline = [
+            (start + 1.0, start + 2.0, "Closed_Fist"),   # ✊ Dust
+            (start + 5.0, start + 6.0, "Open_Palm"),     # ✋ back
+            (start + 9.0, start + 10.0, "Thumb_Up"),     # 👍 ignored
+            (start + 11.0, start + 12.0, "Pointing_Up"), # ☝️ Portal
+            (start + 15.0, start + 16.0, "Open_Palm"),   # ✋ back
+        ]
+        sent, messages, opened = self.run_loop(frames, mask, timeline)
+        self.assertEqual(len(self.captures_of_empty_room(messages)), 1)
+        vanished = [m for m in messages if m.startswith("Vanished with")]
+        self.assertEqual([m.split(".")[0] for m in vanished], ["Vanished with Dust", "Vanished with Portal"])
+        self.assertEqual(sum(m.startswith("Back!") for m in messages), 2)
+        self.assertTrue(any((frame[12, 20] == room[12, 20]).all() for frame in sent))  # person hidden
+        np.testing.assert_array_equal(sent[-1], frames[-1])  # visible at the end
+        self.assertEqual(opened, [0])
+
+    def test_open_palm_does_nothing_while_visible_and_vanish_poses_do_nothing_while_gone(self):
+        frames, room, mask = person_scene(300)
+        start = CALIBRATION_FRAMES / 30
+        timeline = [(start + 0.5, start + 1.5, "Open_Palm"), (start + 2.0, start + 3.0, "Victory"),
+                    (start + 6.0, start + 7.0, "ILoveYou")]
+        _, messages, _ = self.run_loop(frames, mask, timeline)
+        self.assertEqual([m for m in messages if m.startswith(("Vanished", "Back"))][:1],
+                         ["Vanished with Dissolve. Show ✋ (or press Reappear) to come back."])
+        self.assertFalse(any(m.startswith("Back") for m in messages))
+
+    def test_quick_gesture_does_not_trigger(self):
         frames, room, mask = person_scene(60)
-        sent, _ = self.run_loop(frames, mask, gestures=[True, False, False, False, True])
+        start = CALIBRATION_FRAMES / 30
+        sent, messages, _ = self.run_loop(frames, mask, [(start + 0.5, start + 0.75, "Thumb_Down")])
+        self.assertFalse(any(m.startswith("Vanished") for m in messages))
         for frame, original in zip(sent, frames):
             np.testing.assert_array_equal(frame, original)
 
-    def test_naruto_palms_together_then_open_palm(self):
-        frames, room, mask = person_scene(200, height=48, width=80)
-        mask = np.zeros((48, 80), np.float32)
-        mask[10:40, 30:50] = 1.0
-        for frame in frames[int(app.CALIBRATION_SECONDS * 30) + 2:]:
-            frame[10:40, 30:50] = 220
-        sent, recognizer = self.run_loop(frames, mask, mode="naruto",
-                                         gestures=[True] * 8, palms=[False] * 25 + [True] * 8)
-        self.assertTrue(any((frame[25, 40] == 100).all() for frame in sent))
-        np.testing.assert_array_equal(sent[-1], frames[-1])
+    def test_switching_webcam_keeps_the_session_and_virtual_camera(self):
+        frames, room, mask = person_scene(200)
+        remote = [None] * (CALIBRATION_FRAMES + 10) + ["camera:1"]
+        _, messages, opened = self.run_loop(frames, mask, remote=remote, headless=True, cameras=2)
+        self.assertEqual(opened, [0, 1])
+        self.assertEqual(len(self.captures_of_empty_room(messages)), 2)  # new view, new background
+        self.assertTrue(any(m.startswith("Switched webcam") for m in messages))
 
-    def test_headless_run_is_driven_by_remote_commands(self):
-        frames, room, mask = person_scene(170)
-        start = int(app.CALIBRATION_SECONDS * 30) + 2
-        remote = [None] * (start + 5) + ["vanish"] + [None] * 90 + ["reappear"]
-        sent, _ = self.run_loop(frames, mask, remote=remote, headless=True)
-        self.assertTrue(any((frame[12, 20] == room[12, 20]).all() for frame in sent))
+    def test_paused_gestures_are_ignored_until_resumed(self):
+        frames, room, mask = person_scene(200)
+        start = CALIBRATION_FRAMES / 30
+        remote = [None] * (CALIBRATION_FRAMES + 5) + ["gestures:off"]
+        _, messages, _ = self.run_loop(frames, mask, [(start + 1.0, start + 3.0, "Closed_Fist")],
+                                       remote=remote, headless=True)
+        self.assertIn("Gestures paused. Use the buttons to vanish and reappear.", messages)
+        self.assertFalse(any(m.startswith("Vanished") for m in messages))
+
+    def test_headless_buttons_pick_any_effect(self):
+        frames, room, mask = person_scene(200)
+        remote = [None] * (CALIBRATION_FRAMES + 5) + ["vanish:glitch"] + [None] * 60 + ["reappear"]
+        sent, messages, _ = self.run_loop(frames, mask, remote=remote, headless=True)
+        self.assertTrue(any(m.startswith("Vanished with Glitch") for m in messages))
+        self.assertTrue(any(m.startswith("Back!") for m in messages))
         np.testing.assert_array_equal(sent[-1], frames[-1])
 
     def test_all_devices_close_on_send_error(self):
@@ -205,6 +243,7 @@ class VideoLoopTests(unittest.TestCase):
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), Mock())))
             mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
+            mocks.enter_context(patch.object(app, "EffectSound", return_value=Mock()))
             mocks.enter_context(patch("builtins.print"))
             with self.assertRaisesRegex(RuntimeError, "OBS Virtual Camera is required"):
                 app.run()

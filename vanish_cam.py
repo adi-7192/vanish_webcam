@@ -1,4 +1,8 @@
-"""VanishCam engine: webcam vanish effects sent to the OBS Virtual Camera on macOS."""
+"""VanishCam engine: gesture-triggered vanish effects sent to the OBS Virtual Camera.
+
+One session runs from Start to Stop: the empty room is captured once, then each
+vanish gesture plays its own effect and an open palm brings you back.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +26,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 from effects import (
-    STYLES, GestureHold, LiveBackground, VanishEffect, cover_mask,
+    GESTURE_EFFECTS, REAPPEAR_POSE, STYLES, LiveBackground, PoseHold, VanishEffect, cover_mask,
     joined_hands_from_landmarks, open_palm_from_landmarks,
 )
 from vanish_sound import EffectSound, sound_paths
@@ -34,7 +38,6 @@ WINDOW_NAME = "VanishCam Preview"
 
 SEGMENTER_MODEL = MODEL_DIR / "selfie_segmenter_landscape.tflite"
 GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
-HAND_MODEL = APP_DIR / "hand_landmarker.task"
 
 MODEL_URLS = {
     SEGMENTER_MODEL: (
@@ -63,7 +66,7 @@ KEY_COMMANDS = {
     ord(" "): "background", ord("r"): "reappear", ord("v"): "vanish",
     ord("f"): "fullscreen", ord("q"): "quit", 27: "quit",
 }
-CONTROL_COMMANDS = frozenset(KEY_COMMANDS.values()) | {"preview"}
+SIMPLE_COMMANDS = frozenset(KEY_COMMANDS.values()) | {"preview"}
 
 # The OBS camera extension advertises only 1920x1080 to apps but passes on
 # whatever size it is sent. Chrome rescales; WhatsApp and other native apps
@@ -72,15 +75,34 @@ VIRTUAL_CAMERA_SIZE = (1920, 1080)
 
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
-GESTURE_INTERVAL_SECONDS = 0.14
-NARUTO_GESTURE_INTERVAL_SECONDS = 0.08
+GESTURE_INTERVAL_SECONDS = 0.1
 VICTORY_MIN_SCORE = 0.62
-MODES = tuple(STYLES)  # normal, naruto, dust, beam, glitch, portal
+POSE_MIN_SCORE = 0.6
+CANNED_POSES = ("Open_Palm", "Closed_Fist", "Pointing_Up", "ILoveYou", "Thumb_Down")
+EFFECT_NAMES = {
+    "normal": "Dissolve", "naruto": "Smoke puff", "dust": "Dust",
+    "beam": "Teleport", "glitch": "Glitch", "portal": "Portal",
+}
+GESTURE_HELP = "✌️ Dissolve · ✊ Dust · ☝️ Portal · 🤟 Glitch · 👎 Teleport · 🙏 Smoke puff"
 
 
-def vanish_pose(mode: str) -> str:
-    """Naruto uses palms together; every other effect uses the V sign."""
-    return "palms together 🙏" if mode == "naruto" else "a V sign ✌️"
+def parse_command(text: str) -> str | None:
+    """Normalise a control command, or None if it is not valid.
+
+    Simple commands: vanish, reappear, background, preview, fullscreen, quit.
+    With a value: vanish:<effect>, camera:<index>, gestures:on|off.
+    """
+    command = text.strip().lower()
+    if command in SIMPLE_COMMANDS:
+        return command
+    name, _, value = command.partition(":")
+    if name == "vanish" and value in STYLES:
+        return command
+    if name == "camera" and value.isdigit():
+        return command
+    if name == "gestures" and value in ("on", "off"):
+        return command
+    return None
 
 
 def positive_fps(value: str) -> float:
@@ -92,7 +114,7 @@ def positive_fps(value: str) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="VanishCam: Normal or Naruto vanish effects for your webcam."
+        description="VanishCam: gesture-triggered vanish effects for your webcam."
     )
     parser.add_argument("--camera", type=int, default=0, help="Webcam index")
     parser.add_argument("--width", type=int, default=960, help="Video width")
@@ -109,8 +131,8 @@ def parse_args() -> argparse.Namespace:
         help="Require the virtual camera; by default it is used when available. --no-virtual-camera disables it",
     )
     parser.add_argument(
-        "--mode", choices=MODES,
-        help="Skip the start menu and use this mode",
+        "--button-effect", choices=tuple(STYLES), default="normal",
+        help="Effect used by the V key / Vanish button (gestures pick their own)",
     )
     parser.add_argument(
         "--no-preview", action="store_true",
@@ -118,7 +140,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--control-stdin", action="store_true",
-        help="Read commands (vanish, reappear, background, preview, quit) from stdin, one per line",
+        help="Read commands from stdin, one per line: vanish, vanish:<effect>, reappear, "
+             "background, camera:<index>, gestures:on|off, preview, quit",
     )
     parser.add_argument(
         "--gesture-debug", action="store_true",
@@ -126,51 +149,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
-
-
-def choose_mode() -> str | None:
-    """Simple keyboard/mouse menu shown before the clean camera feed."""
-    title = "Choose effect"
-    selected = [None]
-    window = np.zeros((420, 700, 3), dtype=np.uint8)
-    window[:] = (26, 29, 34)
-    cv2.putText(window, "CHOOSE YOUR VANISH", (68, 88),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (236, 239, 242), 2, cv2.LINE_AA)
-    buttons = (
-        ("normal", "1  NORMAL VANISH", "V sign  /  dissolve", 140),
-        ("naruto", "2  NARUTO VANISH", "Palms together  /  smoke puff", 260),
-    )
-    for mode, heading, detail, top in buttons:
-        cv2.rectangle(window, (65, top), (635, top + 94), (48, 54, 62), -1, cv2.LINE_AA)
-        cv2.rectangle(window, (65, top), (635, top + 94), (111, 142, 153), 2, cv2.LINE_AA)
-        cv2.putText(window, heading, (90, top + 38),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.77, (240, 245, 247), 2, cv2.LINE_AA)
-        cv2.putText(window, detail, (90, top + 68),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.53, (179, 195, 201), 1, cv2.LINE_AA)
-
-    def on_mouse(event, x, y, flags, userdata):
-        if event == cv2.EVENT_LBUTTONUP and 65 <= x <= 635:
-            for mode, _, _, top in buttons:
-                if top <= y <= top + 94:
-                    selected[0] = mode
-
-    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(title, on_mouse)
-    try:
-        while selected[0] is None:
-            cv2.imshow(title, window)
-            key = cv2.waitKey(30) & 0xFF
-            if key == ord("1"):
-                selected[0] = "normal"
-            elif key == ord("2"):
-                selected[0] = "naruto"
-            elif key in (ord("q"), 27):
-                return None
-            if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
-                return None
-        return selected[0]
-    finally:
-        cv2.destroyWindow(title)
 
 
 def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
@@ -206,11 +184,11 @@ def start_stdin_commands() -> queue.Queue[str]:
 
     def reader() -> None:
         for line in sys.stdin:
-            command = line.strip().lower()
-            if command in CONTROL_COMMANDS:
+            command = parse_command(line)
+            if command is not None:
                 commands.put(command)
-            elif command:
-                say(f"Unknown command: {command}")
+            elif line.strip():
+                say(f"Unknown command: {line.strip()}")
         commands.put("quit")
 
     threading.Thread(target=reader, name="stdin-commands", daemon=True).start()
@@ -252,11 +230,9 @@ def send_virtual_frame(camera, frame: np.ndarray) -> None:
     camera.send(np.ascontiguousarray(fit_frame(frame, camera.width, camera.height)))
 
 
-def download_models(mode: str = "normal") -> None:
+def download_models() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     for destination, url in MODEL_URLS.items():
-        if mode == "naruto" and destination == GESTURE_MODEL:
-            continue
         if destination.exists() and destination.stat().st_size > 100_000:
             continue
 
@@ -317,46 +293,29 @@ def hand_model_image(image: mp.Image) -> mp.Image:
     return mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgba)
 
 
-def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiViewGestureRecognizer | MultiViewHandLandmarker]:
+def create_tasks() -> tuple[vision.ImageSegmenter, "MultiViewGestureRecognizer"]:
     segmenter_options = vision.ImageSegmenterOptions(
         base_options=python.BaseOptions(model_asset_path=str(SEGMENTER_MODEL)),
         running_mode=vision.RunningMode.VIDEO,
         output_confidence_masks=True,
         output_category_mask=False,
     )
-    if mode == "naruto":
-        if not HAND_MODEL.is_file():
-            raise RuntimeError(f"Hand model not found: {HAND_MODEL}")
-        options = vision.HandLandmarkerOptions(
-            base_options=hand_base_options(HAND_MODEL),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
-            min_hand_detection_confidence=0.35,
-            min_hand_presence_confidence=0.35,
-            min_tracking_confidence=0.45,
-        )
-        task_class = vision.HandLandmarker
-        wrapper_class = MultiViewHandLandmarker
-    else:
-        # No canned-gesture allowlist: MediaPipe drops the landmarks of every
-        # hand whose gesture is filtered out, which would hide open palms and
-        # the landmark-based V check. classify_gesture_result picks "Victory".
-        options = vision.GestureRecognizerOptions(
-            base_options=hand_base_options(GESTURE_MODEL),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
-            min_hand_detection_confidence=0.35,
-            min_hand_presence_confidence=0.35,
-            min_tracking_confidence=0.5,
-        )
-        task_class = vision.GestureRecognizer
-        wrapper_class = MultiViewGestureRecognizer
-
+    # One gesture model for every pose, both hands (palms together needs two).
+    # No canned-gesture allowlist: MediaPipe would drop the landmarks of every
+    # hand whose gesture is filtered out, hiding open palms and joined hands.
+    options = vision.GestureRecognizerOptions(
+        base_options=hand_base_options(GESTURE_MODEL),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.35,
+        min_hand_presence_confidence=0.35,
+        min_tracking_confidence=0.5,
+    )
     segmenter = vision.ImageSegmenter.create_from_options(segmenter_options)
     try:
-        primary = task_class.create_from_options(options)
+        primary = vision.GestureRecognizer.create_from_options(options)
         try:
-            alternate = task_class.create_from_options(
+            alternate = vision.GestureRecognizer.create_from_options(
                 replace(options, running_mode=vision.RunningMode.IMAGE)
             )
         except Exception:
@@ -365,7 +324,7 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
     except Exception:
         segmenter.close()
         raise
-    return segmenter, wrapper_class(primary, alternate)
+    return segmenter, MultiViewGestureRecognizer(primary, alternate)
 
 
 def person_mask(
@@ -543,53 +502,37 @@ class MultiViewHands:
             self.alternate.close()
 
 
+def classify_pose(result, image: mp.Image) -> str | None:
+    """The hand pose in a gesture-model result, most specific first.
+
+    Returns "Joined" (palms together), "Open_Palm", "Victory", "Closed_Fist",
+    "Pointing_Up", "ILoveYou", "Thumb_Down", or None. Thumbs up is ignored on
+    purpose: people use it all the time in calls.
+    """
+    hands = result.hand_landmarks
+    if joined_hands_from_landmarks(hands, image.width, image.height):
+        return "Joined"
+    if open_palm_from_landmarks(hands, image.width, image.height):
+        return "Open_Palm"
+    if classify_gesture_result(result, image)[0] == "Victory":
+        return "Victory"
+    best = None
+    for categories in result.gestures:
+        for category in categories:
+            if (category.category_name in CANNED_POSES and category.score >= POSE_MIN_SCORE
+                    and (best is None or category.score > best[1])):
+                best = (category.category_name, category.score)
+    return best[0] if best else None
+
+
 class MultiViewGestureRecognizer(MultiViewHands):
-    def recognize_gesture(self, image: mp.Image, timestamp_ms: int) -> tuple[str, float]:
+    def recognize_pose(self, image: mp.Image, timestamp_ms: int) -> str | None:
         result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
         self.last_hand_count = len(result.hand_landmarks)
-        best = classify_gesture_result(result, image)
-        if best[0] == "Victory":
-            return best
-
-        def judge(view_result, view):
-            candidate = classify_gesture_result(view_result, view)
-            return candidate if candidate[0] == "Victory" else None
-
-        found = self._search(image, timestamp_ms, self.alternate.recognize, judge)
-        if found:
-            return found
-        if best[0] == "No_Hand" and self.last_hand_count:
-            return "Hand_Detected", 0.0
-        return best
-
-    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
-        self.last_hand_count = len(result.hand_landmarks)
-        if open_palm_from_landmarks(result.hand_landmarks, image.width, image.height):
-            return True
-        judge = lambda found, view: open_palm_from_landmarks(found.hand_landmarks, view.width, view.height)
-        return bool(self._search(image, timestamp_ms, self.alternate.recognize, judge))
-
-
-class MultiViewHandLandmarker(MultiViewHands):
-    attempts_per_check = 2
-
-    def recognize_joined_hands(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
-        self.last_hand_count = len(result.hand_landmarks)
-        if joined_hands_from_landmarks(result.hand_landmarks, image.width, image.height):
-            return True
-        judge = lambda found, view: joined_hands_from_landmarks(found.hand_landmarks, view.width, view.height)
-        return bool(self._search(image, timestamp_ms, self.alternate.detect, judge))
-
-    def detect_open_palm(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
-        self.last_hand_count = len(result.hand_landmarks)
-        if open_palm_from_landmarks(result.hand_landmarks, image.width, image.height):
-            return True
-        judge = lambda found, view: open_palm_from_landmarks(found.hand_landmarks, view.width, view.height)
-        return bool(self._search(image, timestamp_ms, self.alternate.detect, judge))
-
+        pose = classify_pose(result, image)
+        if pose is not None:
+            return pose
+        return self._search(image, timestamp_ms, self.alternate.recognize, classify_pose)
 
 
 class GestureWorker:
@@ -599,9 +542,8 @@ class GestureWorker:
     whenever the worker is free and polls for results without blocking.
     """
 
-    def __init__(self, recognizer, mode: str):
+    def __init__(self, recognizer):
         self.recognizer = recognizer
-        self.mode = mode
         self.jobs: queue.Queue = queue.Queue(maxsize=1)
         self.results: queue.Queue = queue.Queue()
         self.busy = False
@@ -616,7 +558,7 @@ class GestureWorker:
         return True
 
     def poll(self):
-        """(phase, time, seen, detail) of a finished check, or None."""
+        """(phase, time, pose, detail) of a finished check, or None."""
         try:
             result = self.results.get_nowait()
         except queue.Empty:
@@ -624,15 +566,9 @@ class GestureWorker:
         self.busy = False
         return result
 
-    def check(self, phase: str, image: mp.Image, timestamp_ms: int) -> tuple[bool, str]:
-        if phase == "vanished":
-            seen = self.recognizer.detect_open_palm(image, timestamp_ms)
-            return seen, f"open_palm={seen}"
-        if self.mode != "naruto":
-            name, score = recognize_gesture(self.recognizer, image, timestamp_ms)
-            return name == "Victory" and score >= VICTORY_MIN_SCORE, f"{name} score={score:.2f}"
-        seen = self.recognizer.recognize_joined_hands(image, timestamp_ms)
-        return seen, f"hands={self.recognizer.last_hand_count} joined={seen}"
+    def check(self, image: mp.Image, timestamp_ms: int) -> tuple[str | None, str]:
+        pose = self.recognizer.recognize_pose(image, timestamp_ms)
+        return pose, f"pose={pose} hands={self.recognizer.last_hand_count}"
 
     def _run(self) -> None:
         while True:
@@ -641,24 +577,14 @@ class GestureWorker:
                 return
             phase, image, timestamp_ms, now = job
             try:
-                seen, detail = self.check(phase, image, timestamp_ms)
+                pose, detail = self.check(image, timestamp_ms)
             except Exception as error:  # A failed check must not stop the video.
-                seen, detail = False, f"error: {error}"
-            self.results.put((phase, now, seen, detail))
+                pose, detail = None, f"error: {error}"
+            self.results.put((phase, now, pose, detail))
 
     def close(self) -> None:
         self.jobs.put(None)
         self.thread.join(timeout=2)
-
-
-def recognize_gesture(
-    recognizer: MultiViewGestureRecognizer,
-    image: mp.Image,
-    timestamp_ms: int,
-) -> tuple[str, float]:
-    if isinstance(recognizer, MultiViewGestureRecognizer):
-        return recognizer.recognize_gesture(image, timestamp_ms)
-    return classify_gesture_result(recognizer.recognize_for_video(image, timestamp_ms), image)
 
 
 def set_fullscreen(enabled: bool) -> None:
@@ -668,17 +594,16 @@ def set_fullscreen(enabled: bool) -> None:
 
 def self_test() -> int:
     """Check bundled resources and model initialization without opening a webcam."""
-    sounds = [path for mode in MODES for path in sound_paths(mode).values()]
-    required = (SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, *sounds)
+    sounds = [path for style in STYLES for path in sound_paths(style).values()]
+    required = (SEGMENTER_MODEL, GESTURE_MODEL, *sounds)
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"Missing resources: {', '.join(missing)}")
-    for mode in ("normal", "naruto"):
-        segmenter, recognizer = create_tasks(mode)
-        try:
-            recognizer.close()
-        finally:
-            segmenter.close()
+    segmenter, recognizer = create_tasks()
+    try:
+        recognizer.close()
+    finally:
+        segmenter.close()
     say("Self-test passed: models, assets and audio are present.")
     return 0
 
@@ -687,33 +612,32 @@ def run() -> int:
     args = parse_args()
     if getattr(args, "self_test", False):
         return self_test()
-    mode = args.mode or ("normal" if args.no_preview else choose_mode())
-    if mode is None:
-        return 0
     with ExitStack() as resources:
-        return run_camera(args, resources, mode)
+        return run_camera(args, resources)
 
 
 def run_camera(
     args: argparse.Namespace,
     resources: ExitStack,
-    mode: str,
     commands: queue.Queue[str] | None = None,
     on_frame=None,
 ) -> int:
-    """Run the effect loop. ``commands`` feeds control commands; ``on_frame``
-    receives every output frame (used by the Mac app's live thumbnail)."""
-    download_models(mode)
-    capture = open_camera(args.camera, args.width, args.height)
-    resources.callback(capture.release)
+    """Run one session: capture the empty room once, then react to gestures
+    until "quit". ``commands`` feeds control commands; ``on_frame`` receives
+    every output frame (used by the Mac app's live thumbnail)."""
+    download_models()
+    camera_index = args.camera
+    capture = open_camera(camera_index, args.width, args.height)
+    resources.callback(lambda: capture.release())  # whichever webcam is open at the end
     capture.set(cv2.CAP_PROP_FPS, args.fps)
-    segmenter, recognizer = create_tasks(mode)
+    segmenter, recognizer = create_tasks()
     resources.callback(segmenter.close)
     resources.callback(recognizer.close)
-    gestures = GestureWorker(recognizer, mode)
+    gestures = GestureWorker(recognizer)
     resources.callback(gestures.close)  # stops before the recognizer closes
-    sound = EffectSound(mode)
-    resources.callback(sound.close)
+    sounds = {style: EffectSound(style) for style in STYLES}
+    for sound in sounds.values():
+        resources.callback(sound.close)
     resources.callback(cv2.destroyAllWindows)
     if commands is None and args.control_stdin:
         commands = start_stdin_commands()
@@ -722,10 +646,9 @@ def run_camera(
     if preview:
         open_preview(args.width, args.height, fullscreen)
 
-    effect = VanishEffect(mode)
-    vanish_hold, appear_hold = GestureHold(), GestureHold()
-    gesture_interval = (NARUTO_GESTURE_INTERVAL_SECONDS if mode == "naruto"
-                        else GESTURE_INTERVAL_SECONDS)
+    effect = VanishEffect(args.button_effect)
+    hold = PoseHold()
+    gestures_on = True
     background: LiveBackground | None = None
     samples: list[np.ndarray] = []
     cover: np.ndarray | None = None
@@ -739,21 +662,30 @@ def run_camera(
     last_gesture_report = 0.0
     last_timestamp = -1
     square_center: float | None = None
-    say("Step out of the frame for 4 seconds: capturing the background.")
+    say("Step out of the frame for 4 seconds: capturing the empty room.")
     if preview:
         print("[VanishCam] Preview keys: SPACE new background, V vanish, R reappear, F fullscreen, Q quit.")
 
-    def switch(action: str, now: float, current_cover: np.ndarray, frame: np.ndarray) -> None:
-        start = effect.vanish if action == "vanish" else effect.appear
-        if not start(now, current_cover, frame):
-            return
-        vanish_hold.block(now)
-        appear_hold.block(now)
-        sound.play("out" if action == "vanish" else "in")
+    def switch(action: str, now: float, current_cover: np.ndarray, frame: np.ndarray,
+               style: str | None = None) -> None:
         if action == "vanish":
-            say("Vanished. Show an open palm ✋ (or press Reappear) to come back.")
+            if not effect.vanish(now, current_cover, frame, style):
+                return
+            sounds[effect.style_name].play("out")
+            say(f"Vanished with {EFFECT_NAMES[effect.style_name]}. Show ✋ (or press Reappear) to come back.")
         else:
-            say(f"Back! Show {vanish_pose(mode)} to vanish again.")
+            if not effect.appear(now, current_cover, frame):
+                return
+            sounds[effect.style_name].play("in")
+            say(f"Back! {GESTURE_HELP}")
+        hold.block(now)
+
+    def recalibrate(now: float, message: str) -> None:
+        nonlocal calibrating, calibration_started, calibration_remaining
+        calibrating, calibration_started, calibration_remaining = True, now, None
+        samples.clear()
+        effect.reset()
+        say(message)
 
     try:
         while True:
@@ -782,7 +714,7 @@ def run_camera(
                 elapsed = now - calibration_started
                 remaining = max(0, int(np.ceil(CALIBRATION_SECONDS - elapsed)))
                 if remaining != calibration_remaining and remaining > 0:
-                    say(f"Capturing background: {remaining} s left. Stay out of the frame.")
+                    say(f"Capturing the empty room: {remaining} s left. Stay out of the frame.")
                 calibration_remaining = remaining
                 if elapsed >= CALIBRATION_SECONDS - BACKGROUND_SAMPLE_SECONDS:
                     samples.append(camera_frame.copy())
@@ -792,10 +724,8 @@ def run_camera(
                     samples.clear()
                     calibrating = False
                     cover = None
-                    effect.reset()
-                    vanish_hold.block(now, 0.5)
-                    appear_hold.block(now, 0.5)
-                    say(f"Ready. Step back in and show {vanish_pose(mode)} to vanish.")
+                    hold.block(now, 0.5)
+                    say(f"Session live. {GESTURE_HELP} to vanish, ✋ to come back.")
                 display = camera_frame
             else:
                 rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
@@ -810,19 +740,20 @@ def run_camera(
 
                 finished = gestures.poll()
                 if finished is not None:
-                    checked_phase, checked_at, seen, detail = finished
+                    checked_phase, checked_at, pose, detail = finished
                     # Ignore results for a phase we have already left.
-                    if checked_phase == effect.phase == "visible":
-                        if vanish_hold.update(seen, checked_at):
-                            switch("vanish", now, cover, camera_frame)
-                    elif checked_phase == effect.phase == "vanished":
-                        if appear_hold.update(seen, checked_at):
+                    if gestures_on and checked_phase == effect.phase == "visible":
+                        fired = hold.update(pose if pose in GESTURE_EFFECTS else None, checked_at)
+                        if fired:
+                            switch("vanish", now, cover, camera_frame, GESTURE_EFFECTS[fired])
+                    elif gestures_on and checked_phase == effect.phase == "vanished":
+                        if hold.update(pose if pose == REAPPEAR_POSE else None, checked_at):
                             switch("appear", now, cover, camera_frame)
                     if args.gesture_debug and now - last_gesture_report >= 1.0:
                         print(f"[Gesture] {detail}", flush=True)
                         last_gesture_report = now
-                if (effect.phase in ("visible", "vanished")
-                        and now - last_gesture_check >= gesture_interval
+                if (gestures_on and effect.phase in ("visible", "vanished")
+                        and now - last_gesture_check >= GESTURE_INTERVAL_SECONDS
                         and gestures.submit(effect.phase, hand_image, timestamp, now)):
                     last_gesture_check = now
 
@@ -838,18 +769,32 @@ def run_camera(
                 cv2.imshow(WINDOW_NAME, display)
                 command = KEY_COMMANDS.get(cv2.waitKey(1) & 0xFF)
             command = command or next_command(commands)
+            name, _, value = (command or "").partition(":")
             if command == "quit":
                 break
             if command == "background":
-                calibrating = True
-                calibration_started = now
-                calibration_remaining = None
-                samples.clear()
-                effect.reset()
-                say("Step out of the frame for 4 seconds: capturing a new background.")
-            elif command in ("vanish", "reappear") and not calibrating:
+                recalibrate(now, "Step out of the frame for 4 seconds: capturing a new background.")
+            elif name in ("vanish", "reappear") and not calibrating:
                 current = cover if cover is not None else np.zeros((height, width), np.float32)
-                switch("vanish" if command == "vanish" else "appear", now, current, camera_frame)
+                if name == "vanish":
+                    switch("vanish", now, current, camera_frame, value or args.button_effect)
+                else:
+                    switch("appear", now, current, camera_frame)
+            elif name == "camera" and int(value) != camera_index:
+                try:
+                    replacement = open_camera(int(value), args.width, args.height)
+                except RuntimeError as error:
+                    say(f"{error} Keeping the current webcam.")
+                else:
+                    capture.release()
+                    capture, camera_index = replacement, int(value)
+                    capture.set(cv2.CAP_PROP_FPS, args.fps)
+                    recalibrate(now, "Switched webcam. Step out of the frame for 4 seconds: "
+                                     "capturing the new view.")
+            elif name == "gestures":
+                gestures_on = value == "on"
+                hold.block(now, 0.0)
+                say("Gestures on." if gestures_on else "Gestures paused. Use the buttons to vanish and reappear.")
             elif command == "fullscreen" and preview:
                 fullscreen = not fullscreen
                 set_fullscreen(fullscreen)
