@@ -1,6 +1,6 @@
 # VanishCam for Mac
 
-Vanish from your webcam in Google Meet, WhatsApp, FaceTime or Zoom. Make a gesture and you dissolve into the background or disappear in a puff of smoke. Show an open palm and you come back.
+Vanish from your webcam in Google Meet, Zoom, WhatsApp Web and other video calls. Make a gesture and you dissolve into the background or disappear in a puff of smoke. Show an open palm and you come back.
 
 Video is processed on your Mac. It is never recorded or sent anywhere.
 
@@ -22,7 +22,7 @@ VanishCam reads your real webcam, adds the effect, and sends the result to the *
 1. Open **VanishCam**. The floating panel and the menu-bar icon appear.
 2. Pick **Normal** or **Naruto**, then press **Start**.
 3. Step out of the frame for 4 seconds while the background is captured. The panel tells you when to step back in.
-4. In Meet, WhatsApp, FaceTime or Zoom, choose **OBS Virtual Camera** as your camera. Each app remembers this. While no effect is running, it shows your normal webcam, so you can leave it selected.
+4. In Meet, Zoom or WhatsApp Web, choose **OBS Virtual Camera** as your camera. Each app remembers this. While no effect is running, it shows your normal webcam, so you can leave it selected.
 5. Make the vanish gesture, or press **Vanish**. Show an open palm ✋, or press **Reappear**, to come back.
 
 The panel floats above your call and never takes focus away from it. Close it any time and reopen it from the menu-bar icon, which has the same controls.
@@ -43,7 +43,7 @@ While you are invisible, the rest of the room stays live: only the area where yo
 - Capture the background with good, steady light. If you move the camera or furniture, press **New background**.
 - Other people who walk into the frame while you are invisible are hidden too.
 - If the thumbnail shows the wrong camera, choose another under **Webcam** in the menu-bar icon.
-- WhatsApp works through the WhatsApp desktop app. Calls placed from your phone always use the phone's camera.
+- **WhatsApp:** use WhatsApp Web in Chrome (web.whatsapp.com), which supports video calls. The WhatsApp desktop app freezes on the OBS camera because it only accepts the 420v pixel format, which OBS does not provide ([details](https://github.com/kortexa-ai/aicamera/issues/71)). Calls from your phone always use the phone's camera.
 - The Naruto sound plays on your speakers, not into the call.
 - Your self-view in Meet looks mirrored, as usual. Other people see you the right way round.
 

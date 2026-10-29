@@ -2,7 +2,7 @@
 
 The effect engine (vanish_cam.run_camera) runs on a background thread and sends
 its video to the OBS Virtual Camera. Pick "OBS Virtual Camera" once in Google
-Meet, WhatsApp, FaceTime or Zoom; while no effect runs it shows your normal
+Meet, Zoom or WhatsApp Web; while no effect runs it shows your normal
 webcam, so it can stay selected.
 """
 
@@ -261,7 +261,7 @@ class Controller(NSObject):
                             "Extensions). Click 'Camera setup help'.")
         else:
             self.setStatus_("Press Start, then pick 'OBS Virtual Camera' as the camera in "
-                            "Meet, WhatsApp, FaceTime or Zoom.")
+                            "Meet, Zoom or WhatsApp Web (in Chrome).")
 
     @objc.python_method
     def savePreferences(self) -> None:
