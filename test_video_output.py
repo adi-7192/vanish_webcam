@@ -27,7 +27,7 @@ class VirtualCameraTests(unittest.TestCase):
         with patch.dict("sys.modules", pyvirtualcam=module):
             self.assertIs(app.open_virtual_camera(arguments(), 640, 480), camera)
         module.Camera.assert_called_once_with(
-            width=640, height=480, fps=30.0, fmt="BGR", backend="obs",
+            width=1920, height=1080, fps=30.0, fmt="BGR", backend="obs",
         )
 
     def test_unavailable_driver_auto_falls_back_but_explicit_mode_fails(self):
@@ -85,6 +85,19 @@ def person_scene(count, height=24, width=40):
     mask[6:20, 14:26] = 1.0
     calibration = int(app.CALIBRATION_SECONDS * 30) + 2
     return [room] * calibration + [person] * count, room, mask
+
+
+class FitFrameTests(unittest.TestCase):
+    def test_16x9_is_scaled_exactly(self):
+        out = app.fit_frame(np.full((540, 960, 3), 50, np.uint8), 1920, 1080)
+        self.assertEqual(out.shape, (1080, 1920, 3))
+        self.assertTrue((out == 50).all())
+
+    def test_4x3_is_letterboxed_not_stretched(self):
+        out = app.fit_frame(np.full((480, 640, 3), 200, np.uint8), 1920, 1080)
+        self.assertEqual(out.shape, (1080, 1920, 3))
+        self.assertTrue((out[:, :200] == 0).all())  # black side bars
+        self.assertTrue((out[:, 960] == 200).all())
 
 
 class VideoLoopTests(unittest.TestCase):

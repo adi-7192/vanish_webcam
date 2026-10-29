@@ -65,6 +65,11 @@ KEY_COMMANDS = {
 }
 CONTROL_COMMANDS = frozenset(KEY_COMMANDS.values()) | {"preview"}
 
+# The OBS camera extension advertises only 1920x1080 to apps but passes on
+# whatever size it is sent. Chrome rescales; WhatsApp and other native apps
+# freeze on a mismatch, so always send exactly the advertised size.
+VIRTUAL_CAMERA_SIZE = (1920, 1080)
+
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
 GESTURE_INTERVAL_SECONDS = 0.14
@@ -164,13 +169,15 @@ def choose_mode() -> str | None:
 
 
 def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
+    """Open the OBS camera at its advertised size; ``width``/``height`` are the
+    webcam's, used only for the log line."""
     if args.virtual_camera is False:
         return None
     try:
         import pyvirtualcam
 
         camera = pyvirtualcam.Camera(
-            width=width, height=height, fps=args.fps,
+            width=VIRTUAL_CAMERA_SIZE[0], height=VIRTUAL_CAMERA_SIZE[1], fps=args.fps,
             fmt=pyvirtualcam.PixelFormat.BGR, backend="obs",
         )
     except (ImportError, RuntimeError, OSError, ValueError) as error:
@@ -184,7 +191,7 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
             raise RuntimeError(message) from error
         say(f"{message} Continuing with the local preview only.")
         return None
-    say(f"Live on {camera.device} ({width}x{height}, up to {args.fps:g} FPS)")
+    say(f"Live on {camera.device} ({camera.width}x{camera.height}, webcam {width}x{height})")
     return camera
 
 
@@ -221,10 +228,23 @@ def open_preview(width: int, height: int, fullscreen: bool) -> None:
         set_fullscreen(True)
 
 
+def fit_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Scale to exactly width x height, letterboxing instead of stretching."""
+    if frame.shape[:2] == (height, width):
+        return frame
+    scale = min(width / frame.shape[1], height / frame.shape[0])
+    size = (max(1, round(frame.shape[1] * scale)), max(1, round(frame.shape[0] * scale)))
+    scaled = cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
+    if size == (width, height):
+        return scaled
+    canvas = np.zeros((height, width, 3), np.uint8)
+    left, top = (width - size[0]) // 2, (height - size[1]) // 2
+    canvas[top:top + size[1], left:left + size[0]] = scaled
+    return canvas
+
+
 def send_virtual_frame(camera, frame: np.ndarray) -> None:
-    if frame.shape[:2] != (camera.height, camera.width):
-        frame = cv2.resize(frame, (camera.width, camera.height), interpolation=cv2.INTER_LINEAR)
-    camera.send(np.ascontiguousarray(frame))
+    camera.send(np.ascontiguousarray(fit_frame(frame, camera.width, camera.height)))
 
 
 def download_models(mode: str = "normal") -> None:
