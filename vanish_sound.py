@@ -1,11 +1,9 @@
-"""Preload the Naruto MP3 and play it without blocking video frames."""
+"""Play the Naruto vanish sound without blocking video frames (macOS afplay)."""
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -15,61 +13,24 @@ SOUND_PATH = Path(__file__).resolve().parent / "assets" / "vanish.MP3"
 class VanishSound:
     def __init__(self, path: Path = SOUND_PATH):
         if not path.is_file():
-            raise RuntimeError(f"Audio Naruto non trovato: {path}")
-        self.path = path
-
-        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-        self.process = None
-        self.player = None
-        # macOS ships afplay; using it avoids loading pygame's SDL2, which
-        # clashes with the copy bundled in opencv-python.
-        if sys.platform == "darwin" and shutil.which("afplay"):
-            self.player = ["afplay", str(path)]
-            return
-        try:
-            from pygame import mixer
-        except ImportError:
-            ffplay = shutil.which("ffplay")
-            if ffplay is None:
-                raise RuntimeError("Per riprodurre vanish.MP3 installa pygame o ffplay.")
-            self.player = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
-                           "-i", str(path)]
-            return
-
-        self.mixer = mixer
-        self.owns_mixer = mixer.get_init() is None
-        try:
-            if self.owns_mixer:
-                mixer.init(frequency=44100, size=-16, channels=2, buffer=256)
-            self.sound = mixer.Sound(str(path))  # Decode once, before opening the webcam.
-        except Exception as error:
-            if self.owns_mixer:
-                mixer.quit()
-            raise RuntimeError(f"Impossibile aprire l'audio Naruto: {error}") from error
+            raise RuntimeError(f"Naruto sound not found: {path}")
+        player = shutil.which("afplay") or "/usr/bin/afplay"
+        self.command = [player, str(path)]
+        self.process: subprocess.Popen | None = None
 
     def play(self) -> None:
-        if self.player is not None:
-            if self.process is not None and self.process.poll() is None:
-                self.process.terminate()
-            try:
-                self.process = subprocess.Popen(
-                    self.player,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except OSError as error:
-                raise RuntimeError(f"Impossibile avviare l'audio Naruto: {error}") from error
-            return
-        self.sound.stop()
-        if self.sound.play() is None:
-            raise RuntimeError("Impossibile avviare l'audio Naruto: nessun canale libero.")
+        self.stop()
+        try:
+            self.process = subprocess.Popen(
+                self.command, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            raise RuntimeError(f"Could not play the Naruto sound: {error}") from error
+
+    def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
 
     def close(self) -> None:
-        if self.player is not None:
-            if self.process is not None and self.process.poll() is None:
-                self.process.terminate()
-            return
-        if self.owns_mixer:
-            self.mixer.quit()
-            self.owns_mixer = False
+        self.stop()

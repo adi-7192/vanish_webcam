@@ -13,7 +13,7 @@ import vanish_cam as app
 def arguments(**overrides):
     values = dict(
         camera=0, width=960, height=540, fps=30.0, fullscreen=False,
-        no_mirror=True, virtual_camera=None, virtual_backend=None, virtual_device=None,
+        no_mirror=True, virtual_camera=None,
         gesture_debug=False, mode="normal", no_preview=False, control_stdin=False,
     )
     values.update(overrides)
@@ -27,7 +27,7 @@ class VirtualCameraTests(unittest.TestCase):
         with patch.dict("sys.modules", pyvirtualcam=module):
             self.assertIs(app.open_virtual_camera(arguments(), 640, 480), camera)
         module.Camera.assert_called_once_with(
-            width=640, height=480, fps=30.0, fmt="BGR", backend=None, device=None,
+            width=640, height=480, fps=30.0, fmt="BGR", backend="obs",
         )
 
     def test_unavailable_driver_auto_falls_back_but_explicit_mode_fails(self):
@@ -35,7 +35,7 @@ class VirtualCameraTests(unittest.TestCase):
                                  PixelFormat=SimpleNamespace(BGR="BGR"))
         with patch.dict("sys.modules", pyvirtualcam=module), patch("builtins.print"):
             self.assertIsNone(app.open_virtual_camera(arguments(), 640, 480))
-            for options in (dict(virtual_camera=True), dict(virtual_backend="obs")):
+            for options in (dict(virtual_camera=True),):
                 with self.assertRaisesRegex(RuntimeError, "driver missing"):
                     app.open_virtual_camera(arguments(**options), 640, 480)
 
@@ -144,7 +144,7 @@ class VideoLoopTests(unittest.TestCase):
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), Mock())))
             mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
             mocks.enter_context(patch("builtins.print"))
-            with self.assertRaisesRegex(RuntimeError, "webcam virtuale"):
+            with self.assertRaisesRegex(RuntimeError, "OBS Virtual Camera is required"):
                 app.run()
         capture.release.assert_called_once()
 
