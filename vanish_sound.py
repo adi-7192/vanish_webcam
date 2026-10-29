@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -19,13 +20,20 @@ class VanishSound:
 
         os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
         self.process = None
-        self.ffplay = None
+        self.player = None
+        # macOS ships afplay; using it avoids loading pygame's SDL2, which
+        # clashes with the copy bundled in opencv-python.
+        if sys.platform == "darwin" and shutil.which("afplay"):
+            self.player = ["afplay", str(path)]
+            return
         try:
             from pygame import mixer
         except ImportError:
-            self.ffplay = shutil.which("ffplay")
-            if self.ffplay is None:
+            ffplay = shutil.which("ffplay")
+            if ffplay is None:
                 raise RuntimeError("Per riprodurre vanish.MP3 installa pygame o ffplay.")
+            self.player = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                           "-i", str(path)]
             return
 
         self.mixer = mixer
@@ -40,13 +48,12 @@ class VanishSound:
             raise RuntimeError(f"Impossibile aprire l'audio Naruto: {error}") from error
 
     def play(self) -> None:
-        if self.ffplay is not None:
+        if self.player is not None:
             if self.process is not None and self.process.poll() is None:
                 self.process.terminate()
             try:
                 self.process = subprocess.Popen(
-                    [self.ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
-                     "-i", str(self.path)],
+                    self.player,
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -59,7 +66,7 @@ class VanishSound:
             raise RuntimeError("Impossibile avviare l'audio Naruto: nessun canale libero.")
 
     def close(self) -> None:
-        if self.ffplay is not None:
+        if self.player is not None:
             if self.process is not None and self.process.poll() is None:
                 self.process.terminate()
             return

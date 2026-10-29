@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import queue
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +54,13 @@ MODEL_URLS = {
         "gesture_recognizer/float16/1/gesture_recognizer.task"
     ),
 }
+
+# Commands accepted from the keyboard (preview window) and from --control-stdin.
+KEY_COMMANDS = {
+    ord(" "): "background", ord("r"): "reappear", ord("v"): "vanish",
+    ord("f"): "fullscreen", ord("q"): "quit", 27: "quit",
+}
+CONTROL_COMMANDS = frozenset(KEY_COMMANDS.values()) | {"preview"}
 
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
@@ -101,6 +110,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode", choices=("normal", "naruto"),
         help="Salta il menu iniziale e avvia direttamente la modalità scelta",
+    )
+    parser.add_argument(
+        "--no-preview", action="store_true",
+        help="Non aprire la finestra di anteprima (utile durante le videochiamate)",
+    )
+    parser.add_argument(
+        "--control-stdin", action="store_true",
+        help="Accetta comandi (vanish, reappear, background, preview, quit) da stdin, uno per riga",
     )
     parser.add_argument(
         "--gesture-debug", action="store_true",
@@ -182,6 +199,39 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
     return camera
 
 
+def start_stdin_commands() -> queue.Queue[str]:
+    """Read control commands from stdin; EOF (parent gone) means quit."""
+    commands: queue.Queue[str] = queue.Queue()
+
+    def reader() -> None:
+        for line in sys.stdin:
+            command = line.strip().lower()
+            if command in CONTROL_COMMANDS:
+                commands.put(command)
+            elif command:
+                print(f"[Webcam] Comando sconosciuto: {command}", flush=True)
+        commands.put("quit")
+
+    threading.Thread(target=reader, name="stdin-commands", daemon=True).start()
+    return commands
+
+
+def next_command(commands: queue.Queue[str] | None) -> str | None:
+    if commands is None:
+        return None
+    try:
+        return commands.get_nowait()
+    except queue.Empty:
+        return None
+
+
+def open_preview(width: int, height: int, fullscreen: bool) -> None:
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, width, height)
+    if fullscreen:
+        set_fullscreen(True)
+
+
 def send_virtual_frame(camera, frame: np.ndarray) -> None:
     if frame.shape[:2] != (camera.height, camera.width):
         frame = cv2.resize(frame, (camera.width, camera.height), interpolation=cv2.INTER_LINEAR)
@@ -232,14 +282,35 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
         capture = cv2.VideoCapture(index)
 
     if not capture.isOpened():
+        hint = ""
+        if platform.system() == "Darwin":
+            hint = (" On macOS, allow camera access for your terminal app in System Settings"
+                    " > Privacy & Security > Camera, then restart it.")
         raise RuntimeError(
-            f"Webcam {index} non disponibile. Chiudi le altre app oppure prova --camera 1."
+            f"Webcam {index} non disponibile. Chiudi le altre app oppure prova --camera 1.{hint}"
         )
 
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return capture
+
+
+def hand_base_options(model: Path) -> python.BaseOptions:
+    # On macOS the hand/gesture graphs abort at startup with "Service is
+    # unavailable" unless they run on the Metal (GPU) delegate.
+    if platform.system() == "Darwin":
+        return python.BaseOptions(model_asset_path=str(model),
+                                  delegate=python.BaseOptions.Delegate.GPU)
+    return python.BaseOptions(model_asset_path=str(model))
+
+
+def hand_model_image(image: mp.Image) -> mp.Image:
+    """The macOS GPU delegate accepts RGBA frames only (RGB aborts the process)."""
+    if platform.system() != "Darwin" or image.image_format != mp.ImageFormat.SRGB:
+        return image
+    rgba = cv2.cvtColor(image.numpy_view(), cv2.COLOR_RGB2RGBA)
+    return mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgba)
 
 
 def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiViewGestureRecognizer | MultiViewHandLandmarker]:
@@ -253,7 +324,7 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
         if not HAND_MODEL.is_file():
             raise RuntimeError(f"Modello delle mani non trovato: {HAND_MODEL}")
         options = vision.HandLandmarkerOptions(
-            base_options=python.BaseOptions(model_asset_path=str(HAND_MODEL)),
+            base_options=hand_base_options(HAND_MODEL),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
             min_hand_detection_confidence=0.35,
@@ -268,7 +339,7 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
             category_allowlist=["Victory"],
         )
         options = vision.GestureRecognizerOptions(
-            base_options=python.BaseOptions(model_asset_path=str(GESTURE_MODEL)),
+            base_options=hand_base_options(GESTURE_MODEL),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
             min_hand_detection_confidence=0.35,
@@ -479,7 +550,7 @@ class MultiViewGestureRecognizer:
         self.retry_cursor = 0
 
     def recognize_gesture(self, image: mp.Image, timestamp_ms: int) -> tuple[str, float]:
-        result = self.primary.recognize_for_video(image, timestamp_ms)
+        result = self.primary.recognize_for_video(hand_model_image(image), timestamp_ms)
         best = classify_gesture_result(result, image)
         if best[0] == "Victory":
             self.preferred_rotation = None
@@ -518,7 +589,7 @@ class MultiViewGestureRecognizer:
                 image_format=mp.ImageFormat.SRGB,
                 data=np.ascontiguousarray(np.rot90(crops[crop], rotation)),
             )
-            result = self.alternate.recognize(rotated)
+            result = self.alternate.recognize(hand_model_image(rotated))
             candidate = classify_gesture_result(result, rotated)
             if candidate[0] == "Victory":
                 self.preferred_rotation = rotation
@@ -551,7 +622,7 @@ class MultiViewHandLandmarker:
         self.retry_cursor = 0
 
     def recognize_joined_hands(self, image: mp.Image, timestamp_ms: int) -> bool:
-        result = self.primary.detect_for_video(image, timestamp_ms)
+        result = self.primary.detect_for_video(hand_model_image(image), timestamp_ms)
         self.last_hand_count = len(result.hand_landmarks)
         if joined_hands_from_landmarks(result.hand_landmarks, image.width, image.height):
             self.preferred_view = None
@@ -583,7 +654,7 @@ class MultiViewHandLandmarker:
                 image_format=mp.ImageFormat.SRGB,
                 data=np.ascontiguousarray(np.rot90(views[crop], rotation)),
             )
-            result = self.alternate.detect(rotated)
+            result = self.alternate.detect(hand_model_image(rotated))
             self.last_hand_count = max(self.last_hand_count, len(result.hand_landmarks))
             if joined_hands_from_landmarks(result.hand_landmarks, rotated.width, rotated.height):
                 self.preferred_view = (crop, rotation)
@@ -639,7 +710,8 @@ def self_test() -> int:
     if missing:
         raise RuntimeError(f"Risorse mancanti: {', '.join(missing)}")
     load_log()
-    import pygame.mixer  # The distributed build must contain its MP3 decoder.
+    if sys.platform != "darwin":
+        import pygame.mixer  # The distributed build must contain its MP3 decoder.
     for mode in ("normal", "naruto"):
         segmenter, recognizer = create_tasks(mode)
         try:
@@ -654,7 +726,7 @@ def run() -> int:
     args = parse_args()
     if getattr(args, "self_test", False):
         return self_test()
-    mode = args.mode or choose_mode()
+    mode = args.mode or ("normal" if args.no_preview else choose_mode())
     if mode is None:
         return 0
     with ExitStack() as resources:
@@ -674,14 +746,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     if vanish_sound is not None:
         resources.callback(vanish_sound.close)
     resources.callback(cv2.destroyAllWindows)
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
+    commands = start_stdin_commands() if args.control_stdin else None
+    preview = not args.no_preview
 
     state = AppState(
         calibration_started=time.perf_counter(), fullscreen=args.fullscreen
     )
-    if state.fullscreen:
-        set_fullscreen(True)
+    if preview:
+        open_preview(args.width, args.height, state.fullscreen)
 
     background: np.ndarray | None = None
     background_samples: list[np.ndarray] = []
@@ -715,6 +787,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 virtual_camera_initialized = True
                 if virtual_camera is not None:
                     resources.callback(virtual_camera.close)
+                elif not preview:
+                    raise RuntimeError(
+                        "Senza anteprima serve la webcam virtuale (OBS Virtual Camera)."
+                    )
             if mode == "normal" and (dissolve_field is None or dissolve_field.shape != (height, width)):
                 dissolve_field, sparkle_noise = make_dissolve_fields(height, width)
             now = time.perf_counter()
@@ -826,12 +902,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
             if virtual_camera is not None:
                 send_virtual_frame(virtual_camera, display)
-            cv2.imshow(WINDOW_NAME, display)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            command = None
+            if preview:
+                cv2.imshow(WINDOW_NAME, display)
+                command = KEY_COMMANDS.get(cv2.waitKey(1) & 0xFF)
+            command = command or next_command(commands)
+            if command == "quit":
                 break
-            if key == ord(" "):
+            if command == "background":
                 state.phase = "calibrating"
                 state.calibration_started = now
                 state.vanish_started = None
@@ -842,7 +920,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 background_samples.clear()
                 calibration_remaining = None
                 print("[Webcam] Esci dall'inquadratura per 4 secondi: acquisisco il nuovo sfondo.")
-            elif key == ord("r"):
+            elif command == "reappear":
                 if background is not None:
                     state.phase = "ready"
                     state.vanish_started = None
@@ -850,16 +928,23 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     log_anchor = None
                     last_mask = None
                     last_mask_at = float("-inf")
-            elif key == ord("v") and background is not None:
+            elif command == "vanish" and background is not None:
                 state.phase = "naruto_vanishing" if mode == "naruto" else "vanishing"
                 state.vanish_started = time.perf_counter()
                 if mode == "naruto":
                     vanish_sound.play()
                     log_anchor = None
                 vanished_frame = None
-            elif key == ord("f"):
+            elif command == "fullscreen" and preview:
                 state.fullscreen = not state.fullscreen
                 set_fullscreen(state.fullscreen)
+            elif command == "preview":
+                preview = not preview
+                if preview:
+                    open_preview(args.width, args.height, state.fullscreen)
+                else:
+                    cv2.destroyWindow(WINDOW_NAME)
+                    cv2.waitKey(1)
             if virtual_camera is not None:
                 virtual_camera.sleep_until_next_frame()
     finally:

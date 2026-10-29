@@ -1,10 +1,12 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import mediapipe as mp
 
-from local_app.vanish_cam import (
+import vanish_cam
+from vanish_cam import (
     AppState, MultiViewGestureRecognizer, recognize_gesture, start_vanish_on_gesture,
     victory_landmark_score,
 )
@@ -218,6 +220,28 @@ class MultiViewTests(unittest.TestCase):
         calls.clear()
         self.assertEqual(recognize_gesture(detector, self.image, 1140)[0], "Victory")
         self.assertEqual(calls, [(37, 24)])
+
+
+class HandModelImageTests(unittest.TestCase):
+    def setUp(self):
+        data = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+        self.image = mp.Image(image_format=mp.ImageFormat.SRGB, data=data)
+
+    def test_macos_gets_rgba_with_same_pixels(self):
+        with patch.object(vanish_cam.platform, "system", return_value="Darwin"):
+            converted = vanish_cam.hand_model_image(self.image)
+        self.assertEqual(converted.image_format, mp.ImageFormat.SRGBA)
+        np.testing.assert_array_equal(converted.numpy_view()[..., :3], self.image.numpy_view())
+        self.assertTrue((converted.numpy_view()[..., 3] == 255).all())
+
+    def test_other_platforms_keep_the_original_image(self):
+        with patch.object(vanish_cam.platform, "system", return_value="Windows"):
+            self.assertIs(vanish_cam.hand_model_image(self.image), self.image)
+
+    def test_macos_uses_gpu_delegate(self):
+        with patch.object(vanish_cam.platform, "system", return_value="Darwin"):
+            options = vanish_cam.hand_base_options(vanish_cam.HAND_MODEL)
+        self.assertEqual(options.delegate, vanish_cam.python.BaseOptions.Delegate.GPU)
 
 
 if __name__ == "__main__":

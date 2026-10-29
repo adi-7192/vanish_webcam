@@ -1,4 +1,5 @@
 import argparse
+import io
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -6,14 +7,14 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from local_app import vanish_cam as app
+import vanish_cam as app
 
 
 def arguments(**overrides):
     values = dict(
         camera=0, width=960, height=540, fps=30.0, fullscreen=False,
         no_mirror=True, virtual_camera=None, virtual_backend=None, virtual_device=None,
-        gesture_debug=False, mode="normal",
+        gesture_debug=False, mode="normal", no_preview=False, control_stdin=False,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -62,7 +63,7 @@ class VirtualCameraTests(unittest.TestCase):
 
 
 class VideoLoopTests(unittest.TestCase):
-    def run_mock_video(self, send_error=None, gesture=("No_Hand", 0.0)):
+    def run_mock_video(self, send_error=None, gesture=("No_Hand", 0.0), headless=False):
         capture = Mock()
         frames = [np.full((24, 40, 3), color, np.uint8) for color in (10, 40, 80, 120, 160)]
         capture.read.side_effect = [(True, frame) for frame in frames]
@@ -71,7 +72,8 @@ class VideoLoopTests(unittest.TestCase):
         camera.send.side_effect = send_error
         displayed = []
         with ExitStack() as mocks:
-            mocks.enter_context(patch.object(app, "parse_args", return_value=arguments()))
+            args = arguments(no_preview=headless, control_stdin=headless)
+            mocks.enter_context(patch.object(app, "parse_args", return_value=args))
             mocks.enter_context(patch.object(app, "download_models"))
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
             mocks.enter_context(patch.object(app, "create_tasks", return_value=(segmenter, recognizer)))
@@ -85,7 +87,12 @@ class VideoLoopTests(unittest.TestCase):
             destroy = mocks.enter_context(patch.object(app.cv2, "destroyAllWindows"))
             mocks.enter_context(patch.object(app.cv2, "imshow", side_effect=lambda name, frame: displayed.append(frame.copy())))
             keys = (0, 0, ord("v") if gesture[0] != "Victory" else 0, 0, ord("q"))
-            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=keys))
+            waitkey = mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=keys))
+            mocks.enter_context(patch.object(app, "start_stdin_commands", return_value=Mock()))
+            remote = [None, None, "vanish", None, "quit"] if headless else []
+            mocks.enter_context(patch.object(
+                app, "next_command", side_effect=lambda commands: remote.pop(0) if remote else None
+            ))
             mocks.enter_context(patch.object(app.cv2, "putText", side_effect=AssertionError("Overlay vietato")))
             mocks.enter_context(patch("builtins.print"))
             if send_error is None:
@@ -100,6 +107,8 @@ class VideoLoopTests(unittest.TestCase):
             recognizer.close.assert_called_once()
             camera.close.assert_called_once()
             destroy.assert_called_once()
+            if headless:
+                waitkey.assert_not_called()
         return frames, camera, displayed
 
     def test_preview_and_virtual_output_are_clean_in_all_phases(self):
@@ -118,8 +127,43 @@ class VideoLoopTests(unittest.TestCase):
         self.assertTrue(np.any(displayed[3] != frames[1]))  # Non ancora sparito.
         np.testing.assert_array_equal(displayed[4], frames[1])  # Animazione completata.
 
+    def test_headless_run_is_driven_by_remote_commands(self):
+        frames, camera, displayed = self.run_mock_video(headless=True)
+        self.assertEqual(displayed, [])
+        self.assertEqual(camera.send.call_count, 5)
+        np.testing.assert_array_equal(camera.send.call_args_list[2].args[0], frames[2])
+        np.testing.assert_array_equal(camera.send.call_args_list[4].args[0], frames[1])
+
+    def test_headless_without_virtual_camera_stops(self):
+        capture = Mock()
+        capture.read.return_value = (True, np.zeros((24, 40, 3), np.uint8))
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(app, "parse_args", return_value=arguments(no_preview=True)))
+            mocks.enter_context(patch.object(app, "download_models"))
+            mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
+            mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), Mock())))
+            mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
+            mocks.enter_context(patch("builtins.print"))
+            with self.assertRaisesRegex(RuntimeError, "webcam virtuale"):
+                app.run()
+        capture.release.assert_called_once()
+
     def test_all_devices_close_on_send_error(self):
         self.run_mock_video(send_error=RuntimeError("send failed"))
+
+
+class StdinCommandTests(unittest.TestCase):
+    def test_known_commands_are_queued_and_eof_quits(self):
+        with patch.object(app.sys, "stdin", io.StringIO("Vanish\nbogus\n\npreview\n")), \
+                patch("builtins.print") as printed:
+            commands = app.start_stdin_commands()
+            received = [commands.get(timeout=2) for _ in range(3)]
+        self.assertEqual(received, ["vanish", "preview", "quit"])
+        printed.assert_called_once()
+
+    def test_next_command_without_queue_or_items(self):
+        self.assertIsNone(app.next_command(None))
+        self.assertIsNone(app.next_command(app.queue.Queue()))
 
 
 if __name__ == "__main__":

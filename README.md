@@ -4,6 +4,33 @@ Video is processed on your computer. It is neither recorded nor sent to a server
 
 For step-by-step instructions in English and Italian, see the [user guide](USER_GUIDE_EN_IT.md).
 
+## macOS: use it in Google Meet, WhatsApp, FaceTime or Zoom
+
+This fork adds macOS support. VanishCam sends its video to the **OBS Virtual Camera**, a system-wide webcam that every Mac app can select.
+
+**One-time setup**
+
+1. Install Python 3.12 (`brew install python@3.12`). MediaPipe does not support newer Python versions yet.
+2. Install [OBS Studio](https://obsproject.com/) 30 or later (`brew install --cask obs`). Open it, click **Start Virtual Camera**, approve the system extension in System Settings (restart if asked), then quit OBS. You only need OBS for this one-time step.
+3. Double-click **`Start VanishCam (Mac).command`**. The first run installs the components. If macOS blocks it, right-click it and choose **Open**.
+4. Allow camera access for Terminal when macOS asks (System Settings > Privacy & Security > Camera).
+
+**Every call**
+
+1. Double-click `Start VanishCam (Mac).command`. A ◌ icon appears in the menu bar. Leave the Terminal window open; closing it quits VanishCam.
+2. From the ◌ menu, choose **Normal Vanish** or **Naruto Vanish**. The icon turns to ◉.
+3. Step out of the frame for 4 seconds while the background is captured. The first menu line shows the progress.
+4. In Meet, WhatsApp, FaceTime or Zoom, choose **OBS Virtual Camera** as the camera. Each app remembers this choice. While no effect is running, the virtual camera shows your normal webcam, so you can leave it selected.
+5. Make the gesture to vanish, or use **Vanish now** in the menu. Use **Reappear** to come back. **Re-capture background** starts the 4-second capture again. **Show/hide preview** opens a local window.
+
+**Notes**
+
+- WhatsApp works through the WhatsApp desktop app for Mac. Calls placed from your phone always use the phone's camera.
+- The Naruto sound plays on your speakers, not into the call.
+- If the wrong camera is used, pick another one under **Webcam** in the menu.
+- To run without the menu bar: `.venv/bin/python vanish_cam.py --virtual-camera` (with a preview window and keyboard controls), or add `--no-preview --control-stdin` and type `vanish`, `reappear`, `background`, `preview` or `quit`.
+- The Particles and Goku modes described below are not in the code yet.
+
 ## ☕ Buy me a coffee
 
 If you like this project and want to support it, you can buy me a coffee through [PayPal](https://paypal.me/nicovic17) or [Revolut](https://revolut.me/nicoauriemma).
@@ -31,10 +58,10 @@ The published EXE may predate the Particles and Goku modes. To use them now, run
 To start a mode without the menu:
 
 ```powershell
-local_app\AVVIA_LOCALE.bat --mode naruto
-local_app\AVVIA_LOCALE.bat --mode normal
-local_app\AVVIA_LOCALE.bat --mode particles
-local_app\AVVIA_LOCALE.bat --mode goku
+AVVIA_LOCALE.bat --mode naruto
+AVVIA_LOCALE.bat --mode normal
+AVVIA_LOCALE.bat --mode particles
+AVVIA_LOCALE.bat --mode goku
 ```
 
 ## Virtual camera and OBS
@@ -44,7 +71,7 @@ If [OBS Studio](https://obsproject.com/) is installed, the app automatically tri
 To use the effect in an OBS scene, run `AVVIA_OBS.bat`, add a **Window Capture** source, select **Webcam - Anteprima**, and then start the virtual camera from OBS. Alternatively, use [Unity Capture](https://github.com/schellingb/UnityCapture) as a separate virtual video source:
 
 ```powershell
-local_app\AVVIA_VIRTUAL.bat --virtual-backend unitycapture
+AVVIA_VIRTUAL.bat --virtual-backend unitycapture
 ```
 
 OBS has only one virtual camera. Do not use it as both an OBS input and output at the same time. See the [pyvirtualcam documentation](https://github.com/letmaik/pyvirtualcam#supported-virtual-cameras).
@@ -62,7 +89,7 @@ The `V` and `R` keys are disabled in Goku mode.
 You can change the camera, resolution, and maximum virtual-output FPS:
 
 ```powershell
-local_app\AVVIA_LOCALE.bat --camera 1 --width 1280 --height 720 --fps 30
+AVVIA_LOCALE.bat --camera 1 --width 1280 --height 720 --fps 30
 ```
 
 To troubleshoot gesture recognition without adding text to the video, pass `--gesture-debug`. Diagnostic information appears only in the terminal.
