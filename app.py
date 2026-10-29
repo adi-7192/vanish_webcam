@@ -30,6 +30,7 @@ from AppKit import (
 from Foundation import NSData
 from PyObjCTools import AppHelper
 
+import call_audio
 import vanish_cam
 
 MODES = (
@@ -122,6 +123,7 @@ class Controller(NSObject):
         if self.mode not in MODE_IDS:
             self.mode = "normal"
         self.camera = int(defaults.integerForKey_("camera"))
+        self.call_audio = None
         self.last_thumbnail = 0.0
         self.engine = Engine(self.frameReady, self.engineStopped)
         vanish_cam.STATUS_LISTENERS.append(
@@ -129,8 +131,10 @@ class Controller(NSObject):
         )
         self.buildPanel()
         self.buildStatusItem()
-        self.refresh()
         self.showSetupStateIfNeeded()
+        if defaults.boolForKey_("callAudio"):
+            self.startCallAudio()
+        self.refresh()
         return self
 
     # ---- UI construction -------------------------------------------------
@@ -140,7 +144,7 @@ class Controller(NSObject):
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
                  | NSWindowStyleMaskHUDWindow | NSWindowStyleMaskNonactivatingPanel)
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 280, 404), style, NSBackingStoreBuffered, False
+            NSMakeRect(0, 0, 280, 436), style, NSBackingStoreBuffered, False
         )
         panel.setTitle_("VanishCam")
         panel.setLevel_(NSFloatingWindowLevel)
@@ -156,38 +160,42 @@ class Controller(NSObject):
             panel.center()
         view = panel.contentView()
 
-        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 248, 260, 146))
+        self.preview = NSImageView.alloc().initWithFrame_(NSMakeRect(10, 280, 260, 146))
         self.preview.setImageScaling_(NSImageScaleProportionallyUpOrDown)
         self.preview.setWantsLayer_(True)
         self.preview.layer().setCornerRadius_(8)
         self.preview.layer().setMasksToBounds_(True)
         view.addSubview_(self.preview)
         self.placeholder = NSTextField.labelWithString_("Camera off")
-        self.placeholder.setFrame_(NSMakeRect(10, 310, 260, 20))
+        self.placeholder.setFrame_(NSMakeRect(10, 342, 260, 20))
         self.placeholder.setAlignment_(1)  # NSTextAlignmentCenter
         self.placeholder.setTextColor_(NSColor.secondaryLabelColor())
         view.addSubview_(self.placeholder)
 
         self.status = NSTextField.wrappingLabelWithString_("")
-        self.status.setFrame_(NSMakeRect(10, 196, 260, 46))
+        self.status.setFrame_(NSMakeRect(10, 228, 260, 46))
         self.status.setFont_(NSFont.systemFontOfSize_(11))
         view.addSubview_(self.status)
 
-        self.effect_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(10, 158, 260, 30), False)
+        self.effect_menu = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(10, 190, 260, 30), False)
         self.effect_menu.addItemsWithTitles_([f"Effect: {label}" for _, label in MODES])
         self.effect_menu.setTarget_(self)
         self.effect_menu.setAction_("modeChanged:")
         view.addSubview_(self.effect_menu)
 
-        self.start_button = self.button("Start", "toggleEngine:", (10, 118, 260, 34))
-        self.vanish_button = self.button("Vanish", "vanish:", (10, 78, 126, 34))
-        self.reappear_button = self.button("Reappear", "reappear:", (144, 78, 126, 34))
-        self.background_button = self.button("New background", "background:", (10, 42, 260, 30))
-        self.setup_button = self.button("Camera setup help", "openSetup:", (10, 8, 260, 28))
+        self.start_button = self.button("Start", "toggleEngine:", (10, 150, 260, 34))
+        self.vanish_button = self.button("Vanish", "vanish:", (10, 110, 126, 34))
+        self.reappear_button = self.button("Reappear", "reappear:", (144, 110, 126, 34))
+        self.background_button = self.button("New background", "background:", (10, 74, 260, 30))
+        self.setup_button = self.button("Camera setup help", "openSetup:", (10, 40, 260, 28))
         for control in (self.start_button, self.vanish_button, self.reappear_button,
                         self.background_button, self.setup_button):
             view.addSubview_(control)
         self.start_button.setKeyEquivalent_("\r")
+        self.call_checkbox = NSButton.checkboxWithTitle_target_action_(
+            "Sound into call (mic: BlackHole 2ch)", self, "toggleCallAudio:")
+        self.call_checkbox.setFrame_(NSMakeRect(12, 10, 258, 22))
+        view.addSubview_(self.call_checkbox)
         self.panel = panel
         panel.orderFrontRegardless()
 
@@ -206,6 +214,7 @@ class Controller(NSObject):
         self.menuItem(menu, "Vanish", "vanish:", "v")
         self.menuItem(menu, "Reappear", "reappear:", "r")
         self.menuItem(menu, "New background", "background:", "b")
+        self.menu_call = self.menuItem(menu, "Sound into call", "toggleCallAudio:")
         menu.addItem_(NSMenuItem.separatorItem())
         effects = NSMenu.alloc().init()
         self.mode_items = {}
@@ -260,6 +269,9 @@ class Controller(NSObject):
             item.setState_(1 if index == self.camera else 0)
         if not running:
             self.preview.setImage_(None)
+        sending = self.call_audio is not None
+        self.call_checkbox.setState_(1 if sending else 0)
+        self.menu_call.setState_(1 if sending else 0)
 
     def setStatus_(self, message) -> None:
         self.status.setStringValue_(message)
@@ -383,15 +395,50 @@ class Controller(NSObject):
         NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(url))
         self.showSetupStateIfNeeded()
 
+    @objc.python_method
+    def startCallAudio(self) -> bool:
+        try:
+            audio = call_audio.CallAudio()
+            audio.start()
+        except Exception as error:  # missing BlackHole, mic permission, device busy
+            self.setStatus_(f"Sound into call is off: {error}")
+            return False
+        self.call_audio = audio
+        self.setStatus_(f"Sound into call: pick 'BlackHole 2ch' as the microphone in your call. "
+                        f"Your voice comes from {audio.microphone_name}.")
+        return True
+
+    @objc.python_method
+    def stopCallAudio(self) -> None:
+        if self.call_audio is not None:
+            self.call_audio.stop()
+            self.call_audio = None
+
+    @objc.IBAction
+    def toggleCallAudio_(self, sender) -> None:
+        if self.call_audio is None:
+            enabled = self.startCallAudio()
+        else:
+            self.stopCallAudio()
+            enabled = False
+            self.setStatus_("Sound into call is off. Switch your call's microphone back to your real mic.")
+        NSUserDefaults.standardUserDefaults().setBool_forKey_(enabled, "callAudio")
+        self.refresh()
+
     @objc.IBAction
     def quit_(self, sender) -> None:
+        self.stopCallAudio()
         self.engine.stop()
         NSApplication.sharedApplication().terminate_(None)
 
 
 def main() -> None:
     if "--self-test" in sys.argv:
-        raise SystemExit(vanish_cam.self_test())
+        result = vanish_cam.self_test()
+        import sounddevice
+        names = [device["name"] for device in sounddevice.query_devices()]
+        print(f"[VanishCam] Audio devices: {', '.join(names)}")
+        raise SystemExit(result)
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     controller = Controller.alloc().init()

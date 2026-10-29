@@ -42,7 +42,7 @@ Pick an effect in the panel's **Effect** menu (or under **Effect** in the menu-b
 
 Each effect has its own sound, played forwards when you vanish and backwards when you come back. The sounds are generated in code (`packaging/make_sounds.py`); the smoke puff uses the original `assets/vanish.MP3`.
 
-Hold a gesture for about a third of a second. A quick, accidental hand shape does not trigger anything, and there is a short pause after each switch. Sounds play on your speakers.
+Hold a gesture for about a third of a second. A quick, accidental hand shape does not trigger anything, and there is a short pause after each switch. Sounds play on your speakers, and can also go into the call (see below).
 
 While you are invisible, the rest of the room stays live: only the area where you are is filled in with the background, which keeps updating as the light changes.
 
@@ -52,8 +52,17 @@ While you are invisible, the rest of the room stays live: only the area where yo
 - Other people who walk into the frame while you are invisible are hidden too.
 - If the thumbnail shows the wrong camera, choose another under **Webcam** in the menu-bar icon.
 - **WhatsApp:** use WhatsApp Web in Chrome (web.whatsapp.com), which supports video calls. The WhatsApp desktop app freezes on the OBS camera because it only accepts the 420v pixel format, which OBS does not provide ([details](https://github.com/kortexa-ai/aicamera/issues/71)). Calls from your phone always use the phone's camera.
-- The Naruto sound plays on your speakers, not into the call.
 - Your self-view in Meet looks mirrored, as usual. Other people see you the right way round.
+
+### Sound into the call
+
+The other person can hear the effect sounds too:
+
+1. Install [BlackHole](https://existential.audio/blackhole/), a free virtual audio cable: `brew install --cask blackhole-2ch` (asks for your password).
+2. In VanishCam, tick **Sound into call** at the bottom of the panel (or in the menu-bar icon). Allow microphone access when macOS asks.
+3. In Meet or Zoom, choose **BlackHole 2ch** as your **microphone**.
+
+VanishCam now passes your real microphone to BlackHole and mixes the effect sounds in, adding only a few milliseconds of delay. Keep VanishCam open while the call uses BlackHole: if you quit it, the call hears silence. When you are done, untick the box and switch the call's microphone back. Headphones avoid the effect sounds also reaching your microphone from your speakers.
 
 ## Build the app
 
@@ -73,7 +82,7 @@ python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python app.py                          # menu-bar app with the floating panel
 .venv/bin/python vanish_cam.py --virtual-camera  # engine with a preview window
-.venv/bin/python -m unittest test_effects test_hands test_vanish_cam test_video_output
+.venv/bin/python -m unittest test_call_audio test_effects test_hands test_vanish_cam test_video_output
 ```
 
 `vanish_cam.py` preview keys: `SPACE` new background, `V` vanish, `R` reappear, `F` fullscreen, `Q` quit. Other options: `--mode normal|naruto`, `--camera N`, `--width`, `--height`, `--fps`, `--no-preview --control-stdin` (read commands from stdin) and `--gesture-debug`.

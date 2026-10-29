@@ -19,7 +19,7 @@ a = Analysis(
     pathex=[str(root)],
     binaries=collect_dynamic_libs("mediapipe"),
     datas=[(str(path), dest) for path, dest in resources] + collect_data_files("mediapipe"),
-    hiddenimports=["mediapipe.tasks.c", "pyvirtualcam"],
+    hiddenimports=["mediapipe.tasks.c", "pyvirtualcam", "sounddevice", "_sounddevice_data"],
     excludes=["tkinter", "pygame", "matplotlib"],
     runtime_hooks=[str(root / "packaging" / "rth_no_matplotlib.py")],
     noarchive=False,
@@ -45,6 +45,7 @@ app = BUNDLE(
         "LSUIElement": True,
         "LSMinimumSystemVersion": "13.0",
         "NSCameraUsageDescription": "VanishCam reads your webcam to add vanish effects before sending the video to your calls.",
+        "NSMicrophoneUsageDescription": "With Sound into call on, VanishCam passes your microphone to BlackHole 2ch and mixes in the effect sounds.",
         "NSHighResolutionCapable": True,
     },
 )

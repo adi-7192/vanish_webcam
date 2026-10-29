@@ -97,6 +97,13 @@ def main() -> None:
         sound = make()
         write(OUT / f"{name}_out.wav", sound)
         write(OUT / f"{name}_in.wav", sound[::-1])
+    # The smoke puff uses the original "poof" for both directions.
+    import shutil
+    import subprocess
+    source = OUT.parent / "vanish.MP3"
+    subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@44100", "-c", "1",
+                    str(source), str(OUT / "naruto_out.wav")], check=True)
+    shutil.copyfile(OUT / "naruto_out.wav", OUT / "naruto_in.wav")
     print(f"Wrote sounds to {OUT}")
 
 

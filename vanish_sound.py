@@ -6,15 +6,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
-ASSETS = Path(__file__).resolve().parent / "assets"
-SOUND_PATH = ASSETS / "vanish.MP3"  # Naruto "poof", both directions
-SOUND_DIR = ASSETS / "sounds"
+import call_audio
+
+SOUND_DIR = Path(__file__).resolve().parent / "assets" / "sounds"
 
 
 def sound_paths(style: str) -> dict[str, Path]:
     """Files for "out" (vanish) and "in" (reappear)."""
-    if style == "naruto":
-        return {"out": SOUND_PATH, "in": SOUND_PATH}
     return {direction: SOUND_DIR / f"{style}_{direction}.wav" for direction in ("out", "in")}
 
 
@@ -28,6 +26,9 @@ class EffectSound:
         self.process: subprocess.Popen | None = None
 
     def play(self, direction: str = "out") -> None:
+        mixer = call_audio.active()
+        if mixer is not None:  # "Sound into call" is on
+            mixer.play(self.paths[direction])
         self.stop()
         try:
             self.process = subprocess.Popen(
