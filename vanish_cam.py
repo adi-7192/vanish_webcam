@@ -567,6 +567,65 @@ class MultiViewHandLandmarker(MultiViewHands):
 
 
 
+class GestureWorker:
+    """Runs gesture checks on their own thread so video frames never wait for them.
+
+    One check is in flight at a time; the video loop submits the latest frame
+    whenever the worker is free and polls for results without blocking.
+    """
+
+    def __init__(self, recognizer, mode: str):
+        self.recognizer = recognizer
+        self.mode = mode
+        self.jobs: queue.Queue = queue.Queue(maxsize=1)
+        self.results: queue.Queue = queue.Queue()
+        self.busy = False
+        self.thread = threading.Thread(target=self._run, name="gestures", daemon=True)
+        self.thread.start()
+
+    def submit(self, phase: str, image: mp.Image, timestamp_ms: int, now: float) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+        self.jobs.put((phase, image, timestamp_ms, now))
+        return True
+
+    def poll(self):
+        """(phase, time, seen, detail) of a finished check, or None."""
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            return None
+        self.busy = False
+        return result
+
+    def check(self, phase: str, image: mp.Image, timestamp_ms: int) -> tuple[bool, str]:
+        if phase == "vanished":
+            seen = self.recognizer.detect_open_palm(image, timestamp_ms)
+            return seen, f"open_palm={seen}"
+        if self.mode == "normal":
+            name, score = recognize_gesture(self.recognizer, image, timestamp_ms)
+            return name == "Victory" and score >= VICTORY_MIN_SCORE, f"{name} score={score:.2f}"
+        seen = self.recognizer.recognize_joined_hands(image, timestamp_ms)
+        return seen, f"hands={self.recognizer.last_hand_count} joined={seen}"
+
+    def _run(self) -> None:
+        while True:
+            job = self.jobs.get()
+            if job is None:
+                return
+            phase, image, timestamp_ms, now = job
+            try:
+                seen, detail = self.check(phase, image, timestamp_ms)
+            except Exception as error:  # A failed check must not stop the video.
+                seen, detail = False, f"error: {error}"
+            self.results.put((phase, now, seen, detail))
+
+    def close(self) -> None:
+        self.jobs.put(None)
+        self.thread.join(timeout=2)
+
+
 def recognize_gesture(
     recognizer: MultiViewGestureRecognizer,
     image: mp.Image,
@@ -625,6 +684,8 @@ def run_camera(
     segmenter, recognizer = create_tasks(mode)
     resources.callback(segmenter.close)
     resources.callback(recognizer.close)
+    gestures = GestureWorker(recognizer, mode)
+    resources.callback(gestures.close)  # stops before the recognizer closes
     sound = VanishSound() if mode == "naruto" else None
     if sound is not None:
         resources.callback(sound.close)
@@ -723,26 +784,23 @@ def run_camera(
                 hand_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(
                     rgb[:side, square_left:square_left + side]))
 
-                if effect.phase in ("visible", "vanished") and now - last_gesture_check >= gesture_interval:
-                    last_gesture_check = now
-                    if effect.phase == "visible":
-                        if mode == "normal":
-                            name, score = recognize_gesture(recognizer, hand_image, timestamp)
-                            seen = name == "Victory" and score >= VICTORY_MIN_SCORE
-                            detail = f"{name} score={score:.2f}"
-                        else:
-                            seen = recognizer.recognize_joined_hands(hand_image, timestamp)
-                            detail = f"hands={recognizer.last_hand_count} joined={seen}"
-                        if vanish_hold.update(seen, now):
+                finished = gestures.poll()
+                if finished is not None:
+                    checked_phase, checked_at, seen, detail = finished
+                    # Ignore results for a phase we have already left.
+                    if checked_phase == effect.phase == "visible":
+                        if vanish_hold.update(seen, checked_at):
                             switch("vanish", now, cover)
-                    else:
-                        seen = recognizer.detect_open_palm(hand_image, timestamp)
-                        detail = f"open_palm={seen}"
-                        if appear_hold.update(seen, now):
+                    elif checked_phase == effect.phase == "vanished":
+                        if appear_hold.update(seen, checked_at):
                             switch("appear", now, cover)
                     if args.gesture_debug and now - last_gesture_report >= 1.0:
                         print(f"[Gesture] {detail}", flush=True)
                         last_gesture_report = now
+                if (effect.phase in ("visible", "vanished")
+                        and now - last_gesture_check >= gesture_interval
+                        and gestures.submit(effect.phase, hand_image, timestamp, now)):
+                    last_gesture_check = now
 
                 plate = background.image if effect.phase != "visible" else camera_frame
                 display = effect.render(camera_frame, plate, cover, now)
@@ -778,8 +836,6 @@ def run_camera(
                 else:
                     cv2.destroyWindow(WINDOW_NAME)
                     cv2.waitKey(1)
-            if virtual_camera is not None:
-                virtual_camera.sleep_until_next_frame()
     finally:
         resources.close()
 

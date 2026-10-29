@@ -215,6 +215,47 @@ class GestureModelOptionsTests(unittest.TestCase):
         self.assertIsNone(getattr(classifier, "category_allowlist", None))
 
 
+class GestureWorkerTests(unittest.TestCase):
+    def wait(self, worker):
+        for _ in range(200):
+            result = worker.poll()
+            if result is not None:
+                return result
+            import time; time.sleep(0.01)
+        self.fail("no gesture result")
+
+    def test_one_check_in_flight_and_results_carry_phase_and_time(self):
+        import threading
+        release = threading.Event()
+        recognizer = SimpleNamespace(detect_open_palm=lambda image, ts: release.wait(2) and True)
+        worker = vanish_cam.GestureWorker(recognizer, "naruto")
+        try:
+            self.assertTrue(worker.submit("vanished", None, 10, 1.5))
+            self.assertFalse(worker.submit("vanished", None, 20, 1.6))  # still busy
+            self.assertIsNone(worker.poll())  # never blocks the video loop
+            release.set()
+            self.assertEqual(self.wait(worker), ("vanished", 1.5, True, "open_palm=True"))
+            self.assertTrue(worker.submit("vanished", None, 30, 1.7))
+        finally:
+            release.set()
+            worker.close()
+
+    def test_failed_check_does_not_kill_the_worker(self):
+        def boom(image, ts):
+            raise RuntimeError("model hiccup")
+        recognizer = SimpleNamespace(recognize_joined_hands=boom, last_hand_count=0)
+        worker = vanish_cam.GestureWorker(recognizer, "naruto")
+        try:
+            worker.submit("visible", None, 10, 1.0)
+            phase, _, seen, detail = self.wait(worker)
+            self.assertFalse(seen)
+            self.assertIn("model hiccup", detail)
+            self.assertTrue(worker.thread.is_alive())
+        finally:
+            worker.close()
+        self.assertFalse(worker.thread.is_alive())
+
+
 class HandModelImageTests(unittest.TestCase):
     def setUp(self):
         data = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
