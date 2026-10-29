@@ -164,3 +164,41 @@ class VanishEffectTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SmoothnessTests(unittest.TestCase):
+    def test_easing_is_gentle_and_symmetric(self):
+        self.assertEqual(effects.ease_in_out_sine(0.0), 0.0)
+        self.assertAlmostEqual(effects.ease_in_out_sine(1.0), 1.0)
+        self.assertLess(effects.ease_in_out_sine(0.1), 0.1)  # slow start
+        for p in (0.1, 0.3, 0.45):
+            self.assertAlmostEqual(effects.ease_in_out_sine(1 - p), 1 - effects.ease_in_out_sine(p))
+
+    def test_easing_only_on_styles_without_their_own_timing(self):
+        eased = {name for name, style in effects.STYLES.items() if style.eased}
+        self.assertEqual(eased, {"dust", "beam", "glitch", "portal"})
+
+    def changed_pixels(self, name, at, blur):
+        original = effects.BLUR_SAMPLES
+        effects.BLUR_SAMPLES = blur
+        try:
+            frame, background, mask = scene()
+            effect = VanishEffect(name)
+            effect.vanish(0.0, mask, frame)
+            out = effect.render(frame, background, mask, at)
+            return out, int((out != effect.render(frame, background, mask, at)).any(axis=2).sum())
+        finally:
+            effects.BLUR_SAMPLES = original
+
+    def test_dust_particles_leave_trails(self):
+        frame, background, _ = scene()
+        sharp, _ = self.changed_pixels("dust", 1.0, blur=1)
+        blurred, _ = self.changed_pixels("dust", 1.0, blur=4)
+        room = (frame == background).all(axis=2)  # where the room shows, particles are visible
+        self.assertGreater(int((blurred != frame).any(axis=2)[~room].sum() + (blurred != background).any(axis=2)[room].sum()),
+                           int((sharp != frame).any(axis=2)[~room].sum() + (sharp != background).any(axis=2)[room].sum()))
+
+    def test_portal_blur_softens_the_spinning_person(self):
+        sharp, _ = self.changed_pixels("portal", 0.8, blur=1)
+        blurred, _ = self.changed_pixels("portal", 0.8, blur=4)
+        self.assertTrue((sharp != blurred).any())

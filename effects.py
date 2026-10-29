@@ -341,9 +341,23 @@ def draw_points(image: np.ndarray, points: np.ndarray, colors: np.ndarray,
             image[y[inside], x[inside]] = (pixels * (1 - a) + colors[inside] * a).astype(np.uint8)
 
 
+# Motion blur covers half a frame interval at 30 fps, like a film camera's
+# 180° shutter: fast motion reads as a smooth streak instead of a jump.
+SHUTTER_SECONDS = 1 / 60
+BLUR_SAMPLES = 4
+
+
+def ease_in_out_sine(p: float) -> float:
+    """Gentle start and finish; symmetric, so reversing mid-effect stays seamless."""
+    return 0.5 - 0.5 * math.cos(math.pi * p)
+
+
 class Style:
     vanish_seconds = 2.0
     appear_seconds = 1.6
+    eased = True        # VanishEffect applies ease_in_out_sine to p
+    seconds = 2.0       # length of the current vanish or reappear
+    appearing = False
 
     def begin(self, frame: np.ndarray | None, cover: np.ndarray, appearing: bool) -> None:
         """Called when a vanish or reappear starts; ``frame`` is the live webcam."""
@@ -356,6 +370,7 @@ class DissolveStyle(Style):
     """Normal: the person dissolves bottom-up with a glowing cyan edge."""
 
     vanish_seconds, appear_seconds = DISSOLVE_SECONDS, REFORM_SECONDS
+    eased = False  # render_dissolve already eases its edge
 
     def __init__(self):
         self.fields: tuple[np.ndarray, np.ndarray] | None = None
@@ -371,6 +386,7 @@ class SmokeStyle(Style):
     """Naruto: a puff of smoke; the person swaps while the smoke is densest."""
 
     vanish_seconds = appear_seconds = SMOKE_SECONDS
+    eased = False  # timed like a real puff
 
     def __init__(self):
         self.anchor = (0, 0, 1)
@@ -435,10 +451,15 @@ class DustStyle(Style):
         if output is frame:
             output = frame.copy()
         a = age[live]
-        points = self.origin[live] + self.velocity[live] * a[:, None]
-        points[:, 1] += np.sin(a * 7 + self.flutter[live]) * 6
         alpha = (1 - a / self.LIFE) ** 1.5 * 0.9
-        draw_points(output, points, self.colors[live], alpha, size=2)
+        origin, velocity, flutter = self.origin[live], self.velocity[live], self.flutter[live]
+        # Motion blur: draw the trail first, the particle's current spot last.
+        for k in reversed(range(BLUR_SAMPLES)):
+            sample = np.maximum(0.0, a - SHUTTER_SECONDS * k / max(1, BLUR_SAMPLES - 1))
+            points = origin + velocity * sample[:, None]
+            points[:, 1] += np.sin(sample * 7 + flutter) * 6
+            weight = 1.0 - k / BLUR_SAMPLES
+            draw_points(output, points, self.colors[live], alpha * weight, size=2)
         return output
 
 
@@ -561,12 +582,24 @@ class PortalStyle(Style):
         opening = _ramp(0.0, 0.25, p) * (1 - _ramp(0.82, 1.0, p))
         if opening > 0.01:  # ring first, so the person spirals in front of it
             self.draw_ring(output, cx, cy, size * 0.55 * opening, p)
-        shrink = _ramp(0.15, 0.85, p)
-        if shrink < 0.99:
+        # Motion blur: average the spinning, shrinking person over the shutter.
+        step = SHUTTER_SECONDS / max(self.seconds, 1e-3) * (1 if self.appearing else -1)
+        coverage = np.zeros((height, width, 1), np.float32)
+        colour = np.zeros((height, width, 3), np.float32)
+        samples = 0
+        for k in range(max(1, BLUR_SAMPLES - 1)):  # three sub-steps keep the cost low
+            shrink = _ramp(0.15, 0.85, float(np.clip(p + step * k / 2, 0.0, 1.0)))
+            samples += 1
+            if shrink >= 0.99:
+                continue
             matrix = cv2.getRotationMatrix2D((float(cx), float(cy)), shrink * 300, 1 - shrink)
-            warped = cv2.warpAffine(frame, matrix, (width, height))
             weight = cv2.warpAffine(cover, matrix, (width, height))[..., None]
-            output = (output.astype(np.float32) * (1 - weight) + warped.astype(np.float32) * weight).astype(np.uint8)
+            coverage += weight
+            colour += cv2.warpAffine(frame, matrix, (width, height)).astype(np.float32) * weight
+        if coverage.any():
+            coverage /= samples
+            colour /= samples
+            output = np.clip(output.astype(np.float32) * (1 - coverage) + colour, 0, 255).astype(np.uint8)
         return output
 
     def draw_ring(self, image, cx, cy, radius, p):
@@ -624,6 +657,7 @@ class VanishEffect:
         if style is not None:
             self.style_name, self.style = style, self.styles[style]
         self.phase, self.started = "vanishing", now
+        self.style.seconds, self.style.appearing = self.style.vanish_seconds, False
         self.style.begin(frame, cover, appearing=False)
         return True
 
@@ -636,6 +670,7 @@ class VanishEffect:
             progress = min(1.0, (now - self.started) / self.style.vanish_seconds)
             started = now - (1.0 - progress) * self.style.appear_seconds
         self.phase, self.started = "appearing", started
+        self.style.seconds, self.style.appearing = self.style.appear_seconds, True
         self.style.begin(frame, cover, appearing=True)
         return True
 
@@ -659,4 +694,7 @@ class VanishEffect:
         if self.phase == "vanished":
             return replace_person(frame, background, cover)
         appearing = self.phase == "appearing"
-        return self.style.render(frame, background, cover, float(np.clip(p, 0.0, 1.0)), appearing)
+        p = float(np.clip(p, 0.0, 1.0))
+        if self.style.eased:
+            p = ease_in_out_sine(p)
+        return self.style.render(frame, background, cover, p, appearing)
